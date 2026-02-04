@@ -1,0 +1,14 @@
+# Sample Game Data - Player Sessions
+# This is sample data for learning purposes
+
+player_id,session_date,playtime_minutes,level_reached,coins_earned,deaths
+P001,2026-01-20,45,5,120,3
+P002,2026-01-20,30,3,80,5
+P003,2026-01-20,60,7,200,2
+P001,2026-01-21,50,6,150,2
+P002,2026-01-21,25,3,60,4
+P004,2026-01-21,90,10,350,1
+P003,2026-01-22,55,8,180,3
+P001,2026-01-22,40,6,110,4
+P005,2026-01-22,70,9,280,2
+P004,2026-01-23,85,11,400,1
