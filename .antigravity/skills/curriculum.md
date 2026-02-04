@@ -3,13 +3,16 @@
 ## Module 1: Python Fundamentals
 - [x] 1.1 Variables and Data Types
 - [x] 1.2 Basic Operations
-- [ ] 1.3 Control Flow (if/else)
-- [ ] 1.4 Loops (for/while)
-- [ ] 1.5 Functions
-- [ ] 1.6 Lists and Dictionaries
+- [x] 1.3 Control Flow (if/else)
+- [x] 1.4 Loops (for/while)
+- [x] 1.5 Functions
+- [x] 1.6 Lists and Dictionaries
 
 ## Module 2: Data Analysis with Pandas
 - [ ] 2.1 Introduction to DataFrames
+  - [x] 2.1.1 Creating DataFrames from dictionaries
+  - [x] 2.1.2 Loading CSV files
+  - [ ] 2.1.3 Basic DataFrame inspection (head, info, describe)
 - [ ] 2.2 Reading and Writing Data
 - [ ] 2.3 Data Inspection and Exploration
 - [ ] 2.4 Filtering and Selecting Data
