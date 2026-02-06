@@ -9,14 +9,20 @@
 - [x] 1.6 Lists and Dictionaries
 
 ## Module 2: Data Analysis with Pandas
-- [ ] 2.1 Introduction to DataFrames
+- [x] 2.1 Introduction to DataFrames
   - [x] 2.1.1 Creating DataFrames from dictionaries
   - [x] 2.1.2 Loading CSV files
-  - [ ] 2.1.3 Basic DataFrame inspection (head, info, describe)
+  - [x] 2.1.3 Basic DataFrame inspection (head, info, describe)
 - [ ] 2.2 Reading and Writing Data
 - [ ] 2.3 Data Inspection and Exploration
-- [ ] 2.4 Filtering and Selecting Data
+- [x] 2.4 Filtering and Selecting Data
+  - [x] 2.4.1 Selecting columns
+  - [x] 2.4.2 Filtering rows with conditions
+  - [x] 2.4.3 Multiple conditions (AND/OR)
 - [ ] 2.5 Grouping and Aggregation
+  - [ ] 2.5.1 Basic groupby operations
+  - [ ] 2.5.2 Multiple aggregation functions
+  - [ ] 2.5.3 Grouping by multiple columns
 - [ ] 2.6 Merging and Joining DataFrames
 
 ## Module 3: Data Visualization
