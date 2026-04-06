@@ -45,8 +45,11 @@ def init_db(db_path: str | None = None) -> duckdb.DuckDBPyConnection:
             product_code        VARCHAR NOT NULL,  -- e.g. 'C06 : Ballistic Hero-ID'
             product_name        VARCHAR,           -- parsed: 'Ballistic Hero'
             market              VARCHAR,           -- e.g. 'Indonesia'
-            st_country_code     VARCHAR,           -- e.g. 'ID'
+            st_country_code     VARCHAR,           -- e.g. 'ID' (primary ST country, legacy)
             unified_app_id      VARCHAR,           -- manual ST mapping (nullable until mapped)
+            genre               VARCHAR,           -- e.g. 'MMORPG', 'MOBA' — for IAP% lookup
+            iap_pct_override    DOUBLE,            -- per-game IAP% override (NULL = use config default)
+            benchmark_valid_to  DATE,              -- exclude benchmark rows after this date (NULL = no cutoff)
             UNIQUE(product_code, market)
         )
     """)
@@ -188,6 +191,38 @@ def init_db(db_path: str | None = None) -> duckdb.DuckDBPyConnection:
     """)
 
     # ══════════════════════════════════════════
+    # FACT TABLES (benchmark accuracy improvement)
+    # ══════════════════════════════════════════
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS fact.fact_top_charts (
+            app_id          VARCHAR NOT NULL,
+            country         VARCHAR NOT NULL,
+            date            DATE NOT NULL,
+            os              VARCHAR NOT NULL,
+            chart_type      VARCHAR NOT NULL,   -- 'free', 'paid', 'grossing'
+            category_id     VARCHAR NOT NULL,
+            rank            INTEGER,
+            loaded_at       TIMESTAMP DEFAULT current_timestamp,
+            UNIQUE(app_id, country, date, os, chart_type, category_id)
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS fact.fact_apple_public_charts (
+            app_id          VARCHAR NOT NULL,
+            country         VARCHAR NOT NULL,
+            date            DATE NOT NULL,
+            chart_type      VARCHAR NOT NULL,   -- 'grossing', 'free', 'paid'
+            rank            INTEGER,
+            name            VARCHAR,
+            publisher_name  VARCHAR,
+            loaded_at       TIMESTAMP DEFAULT current_timestamp,
+            UNIQUE(app_id, country, date, chart_type)
+        )
+    """)
+
+    # ══════════════════════════════════════════
     # FACT TABLES (Phase 7 — medium-priority)
     # ══════════════════════════════════════════
 
@@ -246,12 +281,13 @@ def init_db(db_path: str | None = None) -> duckdb.DuckDBPyConnection:
         CREATE TABLE IF NOT EXISTS analytics.benchmark_accuracy (
             product_code        VARCHAR,
             product_name        VARCHAR,
-            country             VARCHAR,
+            country             VARCHAR,           -- company market name (e.g. 'Sing-Malay')
             month               DATE,
             st_estimate_usd     DOUBLE,
-            actual_usd          DOUBLE,
+            actual_usd          DOUBLE,            -- IAP-only portion of company gross revenue
             variance_pct        DOUBLE,
-            accuracy_tier       VARCHAR,           -- '✅ Accurate', '⚠️ Acceptable', '❌ Unreliable'
+            accuracy_tier       VARCHAR,           -- 'Accurate', 'Acceptable', 'Unreliable'
+            iap_pct             DOUBLE,            -- IAP fraction applied (e.g. 0.35 for MMORPG/SGMY)
             computed_at         TIMESTAMP DEFAULT current_timestamp
         )
     """)
@@ -328,6 +364,103 @@ def init_db(db_path: str | None = None) -> duckdb.DuckDBPyConnection:
             UNIQUE(genre, country, os, forecast_month, period)
         )
     """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS analytics.download_triangulation (
+            unified_app_id      VARCHAR NOT NULL,
+            country             VARCHAR NOT NULL,
+            month               DATE NOT NULL,
+            os                  VARCHAR NOT NULL,
+            st_revenue          DOUBLE,
+            synth_revenue       DOUBLE,            -- downloads × retention_m1 × arpdau × 30
+            actual_iap_usd      DOUBLE,
+            st_vs_actual_pct    DOUBLE,
+            synth_vs_actual_pct DOUBLE,
+            best_estimate_usd   DOUBLE,            -- weighted avg of ST + synthetic
+            confidence          VARCHAR,           -- 'HIGH', 'MEDIUM', 'LOW'
+            computed_at         TIMESTAMP DEFAULT current_timestamp,
+            UNIQUE(unified_app_id, country, month, os)
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS analytics.calibration_factors_v2 (
+            genre                   VARCHAR NOT NULL,
+            market                  VARCHAR NOT NULL,
+            rank_bucket             VARCHAR NOT NULL,  -- 'top10', 'top50', 'top100', 'longtail'
+            calibration_factor      DOUBLE,
+            sample_size             INTEGER,
+            confidence_interval_low  DOUBLE,
+            confidence_interval_high DOUBLE,
+            computed_at             TIMESTAMP DEFAULT current_timestamp,
+            UNIQUE(genre, market, rank_bucket)
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS analytics.rpd_model (
+            unified_app_id      VARCHAR NOT NULL,
+            country             VARCHAR NOT NULL,
+            os                  VARCHAR NOT NULL,
+            month               DATE NOT NULL,
+            downloads           BIGINT,
+            revenue_usd         DOUBLE,
+            rpd_usd             DOUBLE,            -- revenue per download
+            cumulative_downloads BIGINT,
+            cumulative_revenue_usd DOUBLE,
+            ltv_rpd_usd         DOUBLE,            -- cumulative rev / cumulative dl (lifetime RPD proxy)
+            arpu_usd            DOUBLE,            -- revenue / active_users (NULL if no AU data)
+            computed_at         TIMESTAMP DEFAULT current_timestamp,
+            UNIQUE(unified_app_id, country, os, month)
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS analytics.rpd_benchmark (
+            product_code        VARCHAR,
+            product_name        VARCHAR,
+            country             VARCHAR,
+            month               DATE,
+            st_estimate_usd     DOUBLE,
+            rpd_estimate_usd    DOUBLE,            -- downloads × genre-median RPD
+            actual_iap_usd      DOUBLE,
+            rpd_vs_actual_pct   DOUBLE,
+            st_vs_actual_pct    DOUBLE,
+            best_estimate_usd   DOUBLE,
+            accuracy_tier       VARCHAR,
+            computed_at         TIMESTAMP DEFAULT current_timestamp
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS analytics.composite_benchmark (
+            product_code        VARCHAR,
+            product_name        VARCHAR,
+            country             VARCHAR,
+            month               DATE,
+            st_estimate_usd     DOUBLE,
+            synth_estimate_usd  DOUBLE,
+            rank_estimate_usd   DOUBLE,
+            composite_mid_usd   DOUBLE,
+            composite_low_usd   DOUBLE,
+            composite_high_usd  DOUBLE,
+            actual_iap_usd      DOUBLE,
+            composite_variance_pct DOUBLE,
+            accuracy_tier       VARCHAR,           -- 'Accurate', 'Acceptable', 'Unreliable'
+            confidence_level    VARCHAR,           -- 'HIGH', 'MEDIUM', 'LOW'
+            signals_used        VARCHAR,           -- e.g. 'st_revenue,rank,downloads'
+            computed_at         TIMESTAMP DEFAULT current_timestamp
+        )
+    """)
+
+    # Safe column migrations for existing databases
+    for stmt in [
+        "ALTER TABLE dim.dim_company_games ADD COLUMN IF NOT EXISTS genre VARCHAR",
+        "ALTER TABLE dim.dim_company_games ADD COLUMN IF NOT EXISTS iap_pct_override DOUBLE",
+        "ALTER TABLE dim.dim_company_games ADD COLUMN IF NOT EXISTS benchmark_valid_to DATE",
+        "ALTER TABLE analytics.benchmark_accuracy ADD COLUMN IF NOT EXISTS iap_pct DOUBLE",
+    ]:
+        con.execute(stmt)
 
     print(f"✓ Database initialized at: {path}")
     return con

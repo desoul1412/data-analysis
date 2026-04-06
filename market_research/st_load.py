@@ -282,6 +282,41 @@ def load_app_metadata(data: list[dict], os: str, country: str,
     print(f"  ✓ dim_apps: {len(df)} rows loaded")
 
 
+# ── 2.7 Load Top Charts ──────────────────────────────────────────────────────
+
+def load_top_charts(data: list[dict], os: str, country: str, date: str,
+                    chart_type: str, category_id: str, db_path: str | None = None):
+    """
+    Load top_charts API response into fact.fact_top_charts.
+    Rank is derived from list position (1-based).
+    """
+    if not data:
+        print(f"  ⚠ load_top_charts: no data ({chart_type}, {country})")
+        return
+
+    rows = []
+    for rank, item in enumerate(data, start=1):
+        app_id = str(item.get('app_id') or item.get('id') or item.get('ai', ''))
+        if not app_id:
+            continue
+        rows.append({
+            'app_id': app_id,
+            'country': country,
+            'date': date,
+            'os': os,
+            'chart_type': chart_type,
+            'category_id': category_id,
+            'rank': rank,
+        })
+
+    df = pd.DataFrame(rows)
+    con = _con(db_path)
+    _upsert(con, 'fact.fact_top_charts', df,
+            ['app_id', 'country', 'date', 'os', 'chart_type', 'category_id'])
+    con.close()
+    print(f"  ✓ fact_top_charts: {len(df)} rows ({chart_type}, {country})")
+
+
 # ── Quick validation ─────────────────────────────────────────────────────────
 
 def validate_tables(db_path: str | None = None):

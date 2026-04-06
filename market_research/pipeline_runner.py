@@ -3,12 +3,15 @@ Pipeline Runner — CLI orchestrator for the Market Research Pipeline.
 Coordinates initialization, data import, ST API extraction, and analytics.
 
 Usage:
-    python pipeline_runner.py init          # Initialize database
-    python pipeline_runner.py import        # Import company CSV data
-    python pipeline_runner.py extract       # Run ST HIGH-priority extraction
-    python pipeline_runner.py analytics     # Run derived analytics models
-    python pipeline_runner.py status        # Show table row counts
-    python pipeline_runner.py all           # Run everything (init + import + extract + analytics)
+    python pipeline_runner.py init             # Initialize database
+    python pipeline_runner.py import           # Import company CSV data
+    python pipeline_runner.py extract          # Run ST HIGH-priority extraction (gap-fill)
+    python pipeline_runner.py extract-charts   # Fetch ST top grossing charts
+    python pipeline_runner.py extract-apple    # Fetch Apple RSS public charts (no token needed)
+    python pipeline_runner.py analytics        # Run derived analytics models (phases 3-6)
+    python pipeline_runner.py analytics-v2     # Run benchmark accuracy improvement (tasks 1,4,5,6)
+    python pipeline_runner.py status           # Show table row counts
+    python pipeline_runner.py all              # Run everything
 """
 import sys
 import argparse
@@ -173,6 +176,85 @@ def cmd_extract():
     print("\n  ✓ Gap-fill extraction complete")
 
 
+# ── Extract: ST Top Charts ────────────────────────────────────────────────────
+
+def cmd_extract_charts():
+    print("\n=== Extract: ST Top Charts (grossing) ===")
+    _require_token()
+    import st_extract as st
+    import st_load as loader
+
+    ios_cat = '6014'
+    android_cat = 'game'
+    report_date = date.today().replace(day=1).strftime('%Y-%m-%d')
+    all_countries = SEA_MARKETS + ['TW', 'HK']
+
+    # Chart type is OS-specific
+    os_chart_type = {'ios': 'topgrossingapplications', 'android': 'topgrossing'}
+
+    for os_type, category in [('ios', ios_cat), ('android', android_cat)]:
+        ct = os_chart_type[os_type]
+        for country in all_countries:
+            print(f"  Fetching top_charts [{os_type}, {country}]...")
+            data = st.fetch_top_charts(
+                os=os_type, category=category, chart_type=ct,
+                country=country, date=report_date, limit=100,
+            )
+            loader.load_top_charts(
+                data, os=os_type, country=country, date=report_date,
+                chart_type=ct, category_id=category,
+            )
+
+    print("\n  ✓ Top charts extraction complete")
+
+
+# ── Extract: Apple Public RSS Charts ─────────────────────────────────────────
+
+def cmd_extract_apple():
+    print("\n=== Extract: Apple Public RSS Charts ===")
+    from fetch_apple_charts import load_apple_charts
+    load_apple_charts()
+
+
+# ── Analytics v2 (benchmark accuracy improvement) ────────────────────────────
+
+def cmd_analytics_v2():
+    print("\n=== Analytics v2: Benchmark Accuracy Improvement ===")
+    from analytics import (
+        investigate_ys_singmalay,
+        investigate_high_variance_genres,
+        compute_iap_sensitivity,
+        compute_rpd,
+        compute_rpd_benchmark,
+        compute_download_triangulation,
+        get_calibration_factors_v2,
+        compute_composite_benchmark,
+    )
+    print("── Task 1: IAP% Sensitivity ──")
+    compute_iap_sensitivity()
+
+    print("── RPD Model ──")
+    compute_rpd()
+    compute_rpd_benchmark()
+
+    print("── T12: YS Sing-Malay Cutoff ──")
+    investigate_ys_singmalay()
+
+    print("── T13: High-Variance Game Investigation ──")
+    investigate_high_variance_genres()
+
+    print("── Task 4: Download Triangulation ──")
+    compute_download_triangulation()
+
+    print("── Task 5: Enhanced Calibration ──")
+    get_calibration_factors_v2()
+
+    print("── Task 6: Composite Benchmark ──")
+    compute_composite_benchmark()
+
+    print("\n✓ Analytics v2 completed.")
+
+
 # ── Phase 3-6: Analytics ─────────────────────────────────────────────────────
 
 def cmd_analytics():
@@ -216,7 +298,10 @@ def cmd_all():
     cmd_import()
     cmd_import_st_files()   # load historical flat files before any API calls
     cmd_extract()
+    cmd_extract_charts()
+    cmd_extract_apple()
     cmd_analytics()
+    cmd_analytics_v2()
     cmd_status()
 
 
@@ -224,8 +309,12 @@ def cmd_all():
 
 def main():
     parser = argparse.ArgumentParser(description="Market Research Pipeline Runner")
-    parser.add_argument('command', choices=['init', 'import', 'st-files', 'extract',
-                                            'analytics', 'status', 'all'],
+    parser.add_argument('command', choices=[
+                            'init', 'import', 'st-files', 'extract',
+                            'extract-charts', 'extract-apple',
+                            'analytics', 'analytics-v2',
+                            'status', 'all',
+                        ],
                         help="Command to run")
     args = parser.parse_args()
 
@@ -234,7 +323,10 @@ def main():
         'import': cmd_import,
         'st-files': cmd_import_st_files,
         'extract': cmd_extract,
+        'extract-charts': cmd_extract_charts,
+        'extract-apple': cmd_extract_apple,
         'analytics': cmd_analytics,
+        'analytics-v2': cmd_analytics_v2,
         'status': cmd_status,
         'all': cmd_all,
     }

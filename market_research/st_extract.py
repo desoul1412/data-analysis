@@ -116,8 +116,8 @@ def fetch_retention(
     bundle: str = "retention_monthly",
     start_date: str = "",
     end_date: str = "",
-) -> dict:
-    """GET /v1/facets/metrics — retention bundle."""
+) -> list | dict:
+    """GET /v1/facets/metrics — retention bundle. Returns list or dict depending on ST response."""
     data = _get("/v1/facets/metrics", {
         "bundle": bundle,
         "breakdown": "date,app_id",
@@ -126,7 +126,31 @@ def fetch_retention(
         "end_date": end_date,
     })
     _delay()
-    return data if isinstance(data, dict) else {}
+    return data
+
+
+# --- #11. Top Charts (Ranking) ---
+def fetch_top_charts(
+    os: str,
+    category: str,
+    chart_type: str,
+    country: str,
+    date: str,
+    limit: int = 100,
+) -> list[dict]:
+    """GET /v1/{os}/ranking — top free/paid/grossing charts by category×country."""
+    data = _get(f"/v1/{os}/ranking", {
+        "chart_type": chart_type,
+        "category": category,
+        "country": country,
+        "date": date,
+        "limit": limit,
+    })
+    _delay()
+    # API returns {"ranking": [app_id, ...], ...} — normalise to list of dicts
+    if isinstance(data, dict):
+        return [{"app_id": str(aid)} for aid in data.get("ranking", [])]
+    return data if isinstance(data, list) else []
 
 
 # --- #12. Top Apps by Active Users ---

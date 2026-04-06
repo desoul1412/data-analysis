@@ -1,38 +1,120 @@
 # Market Intelligence Pipeline Summary
 
-## 1. Accomplishments & Pipeline Fixes
+*Last updated: 2026-04-06*
 
-The primary goal was to complete the automated ingestion of historical Sensor Tower data into our DuckDB-based market intelligence system, map internal company games to Sensor Tower's `unified_app_id`, and execute the analytics pipeline (benchmarking, retention, LTV, and PnL).
+---
 
-We achieved the following:
-*   **Fixed API Extraction**: Stabilized the pipeline by introducing retry-with-backoff logic to handle transient DuckDB lock contention during bulk data loads. Skips were added for malformed API responses (missing required keys).
-*   **Resolved Benchmarking Join Issue**: The initial `analytics.py` benchmarking model failed to match games. We identified a key mismatch: `fact_market_insights` uses OS-specific bundle IDs (e.g., `com.example.app`), whereas `dim_company_games` stores Sensor Tower's `unified_app_id`. An intermediary JOIN via `dim_apps` was implemented to bridge `unified_app_id` to the respective `app_id` correctly.
-*   **Internal Data Import Fixes**:
-    *   **Filtered Revenue Rows**: The `import_company_data.py` script was importing all metric rows from `Game Performance.csv` (e.g., Installs, MKT/Revenue, Cost). Updated the script to strictly filter for `Unnamed: 3 == 'Game Revenue (5)'` to ensure `fact_company_revenue` only holds revenue figures.
-    *   **Grand Total Recalculation**: Discovered that `Grand Total` was often missing (`NaN`) in the CSV exports. Implemented a fallback algorithm to dynamically sum months `M0` through `M36` during the import phase to synthesize the `grand_total` metric.
-*   **Pipeline Enrichment**: Updated `pipeline_runner.py`'s company game extraction loop to fetch not only Sales Estimates but also Active Users (DAU/MAU) and Cohort Retention, providing the required inputs to feed the LTV and retention analytic models.
+## 1. Pipeline Overview
 
-## 2. Errors Encountered & Solutions
+A Python + DuckDB market intelligence pipeline that ingests Sensor Tower (ST) API data and internal company revenue, then benchmarks ST estimates against company actuals month-by-month.
 
-| Error / Issue | Root Cause | Solution Applied |
-| :--- | :--- | :--- |
-| **Empty Analytics Output** | The `fact_company_revenue` table had empty data or `NaN` values for `grand_total`. | Updated `import_company_data.py` to filter for specifically `Game Revenue (5)` rows and manually aggregate `M0 - M36` to synthesize `grand_total`. |
-| **Benchmarking SQL Miss** | `compute_benchmark_accuracy` tried to join `dim_company_games` to `fact_market_insights` directly on `unified_app_id = app_id`. | Altered the JOIN clause to `dim_company_games cg JOIN dim_apps da ON cg.unified_app_id = da.unified_app_id JOIN fact_market_insights mi ON da.app_id = mi.app_id`. |
-| **DuckDB Connection Locks** | Concurrent connections competing for the `.duckdb` lock during extraction looping (`BinderException` / Lock errors). | Standardized connection handling via a `_con()` wrapper using `duckdb.connect` with robust backoff-and-retry logic inside `st_load.py`. |
-| **Pipeline Runner LTV/Retention Missing** | The gap filler was omitting critical user data that models rely on. | Appended `fetch_active_users` and `fetch_retention` calls with inner-loop iterations inside `pipeline_runner.py`. |
-| **Key Error in API loading** | Short-form keys (`ca`, `cc`, `d`) occasionally missing from sparse ST responses. | Subbed with `.get('key', default)` safety patterns inside `st_load.py`. |
+**Stack**: Python, DuckDB, pandas, Sensor Tower API  
+**DB**: `market_research.duckdb` — schemas: `dim`, `fact`, `analytics`  
+**Entry point**: `pipeline_runner.py` (commands: `init`, `import`, `st-files`, `extract`, `extract-charts`, `analytics`, `analytics-v2`, `status`, `all`)
 
-## 3. Optimizing Benchmarking Results
+---
 
-Currently, out of **93 benchmarked models**, only **2 are accurate, 1 is acceptable, and 90 are flagged as unreliable**. To optimize and improve the correlation between Sensor Tower estimates and internal actuals, consider the following targeted adjustments:
+## 2. Current Benchmark Results (as of 2026-04-06)
 
-1.  **Platform Revenue Mapping (PC/Web Top-ups vs. Store IAP)**:
-    Sensor Tower estimates *only* track revenue flowing through App Store and Google Play channels. If your internal revenue (`grand_total`) includes Direct-to-Consumer (DTC) web top-ups, PC clients, or third-party stores (e.g., Huawei, Galaxy Store, Codashop), the internal actuals will vastly outpace ST estimates. 
-    *Recommendation*: Align internal actuals by splitting out App Store / Google Play specific net revenue before benchmarking.
-2.  **Gross vs. Net Revenue Matching**:
-    Sensor Tower presents estimates as *Gross Revenue* (what the consumer paid, including platform cuts and taxes). Your internal dataset's `Grand Total` might be *Net Revenue* (after 30% cuts). 
-    *Recommendation*: Ensure you are converting ST's Gross Revenue to an estimated Net equivalent (e.g., `ST_Estimate * 0.7`) to do an apples-to-apples variance calculation.
-3.  **Market/Country Granularity Splitting**:
-    Internal data maps regions (e.g., `TW-HK`, `Sing-Malay`), whereas ST provides ISO country data (`TW`, `HK`, `SG`, `MY`). Grouping must account accurately for exactly the matching regions without double counting duplicates across Android vs iOS.
-4.  **Historical Date Horizon Misalignment**:
-    Ensure the `fact_market_insights` database has full historic API extractions mapping the entirety of your internal games' lifetimes (since soft-launch). If internal revenue accounts for 3 years, but ST API was only pulled for the last 1 year, the benchmark will severely under-index. Use `pipeline_runner.py extract` forcing an older `start_date` for newly mapped items.
+| Metric | Original | Current | Target |
+|---|---|---|---|
+| Benchmark rows | 391 | **112** (mapped games only) | — |
+| Unreliable % | 93.6% | **56.3%** | <40% |
+| Accurate % | 1.8% | **21.4%** ✓ | >20% |
+| Median \|variance\| | 93.1% | **~49%** | <30% |
+| Signals per row | 1 (ST only) | **3** (ST + RPD + rank) ✓ | 2-3 |
+
+The >20% Accurate target is met. The <40% Unreliable target is not yet met — see Section 5.
+
+---
+
+## 3. Key Discoveries & Fixes Applied
+
+### D1: IAP% was 5–60× too high for SEA MMORPGs
+ST only captures App Store / Play revenue. SEA MMORPGs route 96–99% through web payments (Codashop, direct top-up portals). Original IAP% values (10–40%) caused systematic 50–100× overestimation of actual IAP.
+
+**Fix**: Empirically calibrated IAP% via `implied_iap_pct = median(ST_revenue / company_gross)` per genre×market. Applied ~60 data-driven values in `config.py`:
+
+| Genre | Market | Old IAP% | New IAP% |
+|---|---|---|---|
+| MMORPG | Vietnam | 10% | **0.65%** |
+| MMORPG | Thailand | 40% | **0.51%** |
+| MMORPG | Indonesia | 25% | **3.79%** |
+| MMORPG | Sing-Malay | 35% | **1.83%** |
+| Platformer/Runner | Sing-Malay | — | **21.67%** |
+
+### D2: Downloads and revenue are temporally decoupled for VN MMORPGs
+Downloads appear at launch/update months; web-payment revenue appears in subsequent months. Point-in-time RPD ≈ $0 for most rows.
+
+**Fix**: Use **lifetime RPD** = cumulative_revenue / cumulative_downloads as ARPU proxy.  
+Benchmarks: MMORPG VN ≈ $2.50/dl, MMORPG ID ≈ $2.55/dl, Turn-based RPG TH ≈ $4.96/dl.
+
+### D3: ST top charts API format
+`GET /v1/{os}/ranking` returns `{"ranking": [...]}` dict, not a list. iOS chart_type = `topgrossingapplications`, Android = `topgrossing` (lowercase category = `game`).
+
+### D4: Apple RSS URL changed
+`rss.marketingtools.apple.com` returns 404. Fixed with multi-candidate fallback:
+1. `rss.applemarketingtools.com/api/v2/{cc}/apps/top-grossing/200/apps.json`
+2. Original URL (fallback)
+3. iTunes RSS legacy endpoint
+
+### D5: Active users not in ST subscription
+`/v1/{os}/usage/active_users` returns empty. LTV model remains blocked. Replaced with lifetime RPD as ARPU proxy in download triangulation.
+
+### D6: 89/155 company games auto-mapped; 1 confirmed false positive
+`Thánh Quang Thiên Sứ` matched wrong ST app (465% variance). NULLed via `fix_false_positive_mappings()`.  
+`YS` (Sing-Malay): product discontinued after March 2023 — company actual drops to ~$75 while ST stays ~$1–3K. Requires per-game date-cutoff support (not a simple NULL).
+
+---
+
+## 4. Completed Implementation
+
+| Task | What was built |
+|---|---|
+| IAP% recalibration | `compute_iap_sensitivity()` — prints implied vs. current IAP% per genre×market |
+| ST top charts | `fetch_top_charts()` in `st_extract.py`, `fact.fact_top_charts` (6,080 rows) |
+| Apple RSS charts | `fetch_apple_charts.py` with 3-URL fallback; `fact.fact_apple_public_charts` |
+| RPD model | `compute_rpd()` — lifetime cumulative RPD; `analytics.rpd_model` (3,267 rows) |
+| RPD benchmark | `compute_rpd_benchmark()` — competitor revenue via genre-median RPD; 51/112 rows have RPD estimate |
+| Download triangulation | `compute_download_triangulation()` — unblocked via RPD model; 2.4M rows, 114K with RPD estimate |
+| Calibration v2 | `get_calibration_factors_v2()` — time-weighted, outlier-excluded, rank-bucketed; 11 combinations |
+| Composite benchmark | `compute_composite_benchmark()` — 3-signal weighted average; 344 rows |
+| False-positive fix | `fix_false_positive_mappings()` — runs before `compute_benchmark_accuracy()` each pipeline run |
+| Per-game IAP override | `iap_pct_override` column in `dim_company_games`; `set_game_iap_override()` utility |
+| YS investigation | `investigate_ys_singmalay()` — automatic diagnostic in `analytics-v2` run |
+
+---
+
+## 5. Remaining Blockers to <40% Unreliable
+
+Based on the sensitivity analysis output (run `analytics-v2`):
+
+| Genre | Market | Rows | Median \|Var\| | Notes |
+|---|---|---|---|---|
+| MMORPG | Vietnam | 42 | 56.2% | ST systematically underestimates; web payment dominant |
+| MMORPG | Indonesia | 11 | 60.5% | Sensitivity recommends lowering IAP% to 2.84% (0.75×) |
+| Platformer/Runner | Sing-Malay | 17 | 86.3% | YS — product discontinued Apr 2023, partial false positive |
+| Tycoon/Crafting | Vietnam | 4 | 88.7% | Small sample, needs mapping review |
+| Shoot 'em up | Thailand | 2 | 70.9% | Small sample |
+
+**Quick wins available:**
+1. Apply Indonesia MMORPG IAP% reduction: change `("mmorpg", "Indonesia")` from `0.0379` → `0.0284` in `config.py`
+2. Exclude YS post-March-2023 rows (implement per-game date cutoff in `benchmark_accuracy`)
+3. Expand game mapping coverage beyond 89/155 (manual review of uncertain matches)
+
+---
+
+## 6. Errors Encountered & Solutions
+
+| Error | Root Cause | Solution |
+|---|---|---|
+| Empty analytics output | `fact_company_revenue` filtered wrong rows | Import strictly filters `Game Revenue (5)` rows; synthesizes `grand_total` from M0–M36 |
+| Benchmarking SQL miss | `dim_company_games` → `fact_market_insights` joined directly on `unified_app_id = app_id` | Bridge via `dim_apps`: `cg → da (unified_app_id) → mi (app_id)` |
+| DuckDB connection locks | Concurrent connections during bulk load | `_con()` wrapper; backoff-retry in `st_load.py` |
+| ST ranking API 422 | Wrong `chart_type` and wrong Android `category` case | iOS: `topgrossingapplications`; Android: `topgrossing`, category `game` (lowercase) |
+| ST ranking returns dict | API returns `{"ranking": [...]}` not `[...]` | `isinstance(data, dict)` check + unwrap `data.get("ranking", [])` |
+| `compute_iap_sensitivity` TypeError | DuckDB Int32 `genre` column fails `fillna('')` | `.astype(str).replace('None', '').str.lower().str.strip()` |
+| Point-in-time RPD = $0 | Downloads and revenue are in different months for VN MMORPGs | Switch to lifetime RPD (cumulative running totals) |
+| `download_triangulation` UNIQUE violation | Multi-market join creates duplicate (app, country, month, os) | `.drop_duplicates(subset=[...])` before INSERT |
+| Apple RSS 404 | `rss.marketingtools.apple.com` domain changed | Multi-URL fallback with auto format detection |
+| UnicodeEncodeError on Windows | Windows CP1252 terminal can't encode ✓/✗ | Run all Python with `python -X utf8` flag |

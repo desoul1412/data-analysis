@@ -58,6 +58,7 @@ def import_game_performance(con: duckdb.DuckDBPyConnection):
             'market': row['Market'],
             'st_country_code': COMPANY_MARKET_TO_ST.get(row['Market'], ''),
             'unified_app_id': None,
+            'genre': None,   # fill manually: MMORPG, MOBA, Team Battle, Battle Royale, Shooting
         })
 
     dim_df = pd.DataFrame(dim_rows)
