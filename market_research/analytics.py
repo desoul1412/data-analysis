@@ -629,6 +629,97 @@ def compute_ltv_model(db_path: str | None = None) -> pd.DataFrame:
     return out_df
 
 
+def compute_ltv_model_v2(db_path: str | None = None) -> pd.DataFrame:
+    """
+    Compute LTV(n) using RPD-based ARPDAU proxy instead of active_users.
+
+    ARPDAU proxy = median(ltv_rpd_usd) per genre×country from rpd_model.
+    LTV(n) = Σ(m=0..n) [arpdau_proxy × retention_rate(m)]
+
+    Joins rpd_model → dim_apps (via unified_app_id) for ST category_id.
+    Joins cohort_retention for genre-average retention curves.
+    """
+    con = _con(db_path)
+
+    # Step 1: Genre-level RPD (ARPDAU proxy) from rpd_model + dim_apps
+    rpd_df = con.execute("""
+        WITH app_cat AS (
+            SELECT app_id, unified_app_id,
+                   FIRST(category_id) AS genre
+            FROM dim.dim_apps
+            WHERE category_id IS NOT NULL
+              AND category_id NOT IN ('', 'NaN', '0')
+              AND unified_app_id IS NOT NULL
+            GROUP BY app_id, unified_app_id
+        )
+        SELECT ac.genre, rpm.country, rpm.os,
+               MEDIAN(rpm.ltv_rpd_usd) AS median_rpd,
+               COUNT(DISTINCT rpm.unified_app_id) AS sample_size
+        FROM analytics.rpd_model rpm
+        JOIN app_cat ac ON ac.unified_app_id = rpm.unified_app_id
+        WHERE rpm.ltv_rpd_usd IS NOT NULL AND rpm.ltv_rpd_usd > 0
+        GROUP BY ac.genre, rpm.country, rpm.os
+    """).df()
+
+    # Step 2: Genre-average retention curves
+    ret_df = con.execute("""
+        SELECT genre, country, os, period,
+               AVG(retention_pct) / 100.0 AS retention_rate
+        FROM analytics.cohort_retention
+        GROUP BY genre, country, os, period
+        ORDER BY genre, country, os, period
+    """).df()
+
+    if rpd_df.empty or ret_df.empty:
+        print("  ○ ltv_model_v2: need rpd_model + cohort_retention data")
+        con.close()
+        return pd.DataFrame()
+
+    # Step 3: Merge and compute cumulative LTV
+    merged = rpd_df.merge(ret_df, on=['genre', 'country', 'os'], how='inner')
+    merged = merged.sort_values(['genre', 'country', 'os', 'period'])
+
+    rows_out = []
+    for (genre, country, os_val), grp in merged.groupby(['genre', 'country', 'os']):
+        arpdau = float(grp['median_rpd'].iloc[0])
+        cumulative_ltv = 0.0
+        for _, row in grp.iterrows():
+            month_rev = arpdau * row['retention_rate']
+            cumulative_ltv += month_rev
+            rows_out.append({
+                'genre': genre,
+                'subgenre': None,
+                'country': country,
+                'os': os_val,
+                'period': int(row['period']),
+                'arpdau': round(arpdau, 4),
+                'retention_pct': round(row['retention_rate'] * 100, 2),
+                'ltv_usd': round(cumulative_ltv, 4),
+            })
+
+    out_df = pd.DataFrame(rows_out)
+    if out_df.empty:
+        print("  ○ ltv_model_v2: no cross-matched genre data")
+        con.close()
+        return out_df
+
+    con.execute("DELETE FROM analytics.ltv_model")
+    con.execute("""
+        INSERT INTO analytics.ltv_model
+            (genre, subgenre, country, os, period, arpdau, retention_pct, ltv_usd, computed_at)
+        SELECT genre, subgenre, country, os, period, arpdau, retention_pct, ltv_usd,
+               current_timestamp
+        FROM out_df
+    """)
+
+    n = len(out_df)
+    genres = out_df['genre'].nunique()
+    max_ltv = out_df['ltv_usd'].max()
+    print(f"  ✓ ltv_model_v2: {n} rows ({genres} genres, max LTV=${max_ltv:.2f})")
+    con.close()
+    return out_df
+
+
 # ────────────────────────────────────────────────────────
 # PHASE 6: GENRE PnL TEMPLATE
 # ────────────────────────────────────────────────────────
@@ -770,6 +861,174 @@ def compute_genre_pnl(report_month: str, db_path: str | None = None) -> pd.DataF
     return df
 
 
+def compute_genre_pnl_v2(report_month: str | None = None,
+                          db_path: str | None = None) -> pd.DataFrame:
+    """
+    Genre PnL v2 — uses fact_market_insights for TAM instead of sparse fact_genre_summary.
+
+    For each ST category × country × month:
+      - TAM from MI aggregated by dim_apps.category_id
+      - Genre revenue share = genre_tam / store_tam
+      - Growth = TAM delta vs 3 months prior
+      - HHI + concentration tier from analytics.genre_concentration
+      - LTV/retention from analytics.ltv_model + analytics.cohort_retention
+
+    Writes to analytics.genre_pnl_template.
+    """
+    con = _con(db_path)
+
+    month_filter = f"AND gt.month = '{report_month}'::DATE" if report_month else ""
+
+    df = con.execute(f"""
+        WITH app_cat AS (
+            SELECT app_id,
+                   FIRST(category_id) AS st_category
+            FROM dim.dim_apps
+            WHERE category_id IS NOT NULL
+              AND category_id NOT IN ('', 'NaN', '0')
+            GROUP BY app_id
+        ),
+        genre_tam AS (
+            SELECT ac.st_category AS genre,
+                   mi.country,
+                   mi.date AS month,
+                   SUM(mi.revenue_cents) / 100.0  AS genre_tam_usd,
+                   SUM(mi.downloads)               AS genre_downloads,
+                   COUNT(DISTINCT mi.app_id)        AS app_count
+            FROM fact.fact_market_insights mi
+            JOIN app_cat ac ON mi.app_id = ac.app_id
+            WHERE mi.revenue_cents > 0
+            GROUP BY ac.st_category, mi.country, mi.date
+        ),
+        store_tam AS (
+            SELECT country, date AS month,
+                   SUM(revenue_cents) / 100.0 AS store_tam_usd
+            FROM fact.fact_market_insights
+            WHERE revenue_cents > 0
+            GROUP BY country, date
+        ),
+        conc AS (
+            SELECT st_category, country, month,
+                   hhi_top10, concentration_tier,
+                   top1_share_pct, top10_share_pct
+            FROM analytics.genre_concentration
+        ),
+        ltv AS (
+            SELECT genre, country, os,
+                   MAX(CASE WHEN period <= 1 THEN ltv_usd END) AS ltv_30,
+                   MAX(CASE WHEN period <= 3 THEN ltv_usd END) AS ltv_90
+            FROM analytics.ltv_model
+            GROUP BY genre, country, os
+        ),
+        ret AS (
+            SELECT genre, country, os,
+                   AVG(CASE WHEN period = 0 THEN retention_pct END) AS d1_ret,
+                   AVG(CASE WHEN period = 1 THEN retention_pct END) AS d30_ret
+            FROM analytics.cohort_retention
+            GROUP BY genre, country, os
+        ),
+        arpdau_tbl AS (
+            SELECT genre, country, os, AVG(arpdau) AS arpdau
+            FROM analytics.ltv_model GROUP BY genre, country, os
+        )
+        SELECT
+            gt.genre,
+            gt.country,
+            'unified' AS os,
+            gt.month AS report_month,
+            st.store_tam_usd AS tam_usd,
+            ROUND(gt.genre_tam_usd / NULLIF(st.store_tam_usd, 0), 4) AS genre_revenue_share,
+            gt.genre_tam_usd,
+            c.hhi_top10 AS hhi_score,
+            c.concentration_tier,
+            c.top1_share_pct,
+            c.top10_share_pct,
+            l.ltv_30,
+            l.ltv_90,
+            r.d1_ret AS d1_retention,
+            r.d30_ret AS d30_retention,
+            a.arpdau,
+            gt.genre_downloads,
+            gt.app_count
+        FROM genre_tam gt
+        JOIN store_tam st ON st.country = gt.country AND st.month = gt.month
+        LEFT JOIN conc c ON c.st_category = gt.genre
+            AND c.country = gt.country AND c.month = gt.month
+        LEFT JOIN (
+            SELECT genre, country, AVG(ltv_30) AS ltv_30, AVG(ltv_90) AS ltv_90
+            FROM ltv GROUP BY genre, country
+        ) l ON l.genre = gt.genre AND l.country = gt.country
+        LEFT JOIN (
+            SELECT genre, country, AVG(d1_ret) AS d1_ret, AVG(d30_ret) AS d30_ret
+            FROM ret GROUP BY genre, country
+        ) r ON r.genre = gt.genre AND r.country = gt.country
+        LEFT JOIN (
+            SELECT genre, country, AVG(arpdau) AS arpdau
+            FROM arpdau_tbl GROUP BY genre, country
+        ) a ON a.genre = gt.genre AND a.country = gt.country
+        WHERE gt.genre_tam_usd > 0
+        {month_filter}
+    """).df()
+
+    if df.empty:
+        print(f"  ○ genre_pnl_v2: no data")
+        con.close()
+        return df
+
+    # Compute TAM growth (3 months prior)
+    df = df.sort_values(['genre', 'country', 'report_month'])
+    df['tam_growth_3m'] = (
+        df.groupby(['genre', 'country'])['genre_tam_usd']
+          .transform(lambda s: (s - s.shift(3)) / s.shift(3).replace(0, float('nan')))
+    )
+
+    # Opportunity score
+    med_ltv = df['ltv_90'].median() or 0
+    def _score_v2(row) -> str:
+        growth = row.get('tam_growth_3m')
+        hhi = row.get('hhi_score') or 0
+        ltv = row.get('ltv_90') or 0
+        if pd.notna(growth) and growth > 0.10 and hhi < 0.25 and ltv > med_ltv:
+            return 'HIGH'
+        if (pd.notna(growth) and growth < -0.05) or hhi > 0.50:
+            return 'LOW'
+        return 'MEDIUM'
+
+    df['opportunity_score'] = df.apply(_score_v2, axis=1)
+
+    # Prepare for insert — map columns to existing table schema
+    df['subgenre'] = None
+    df['top10_revenue_usd'] = None
+    df['top10_dau'] = None
+    df['num_advertisers'] = None
+
+    # Upsert
+    con.execute("DELETE FROM analytics.genre_pnl_template")
+    tbl_cols = [r[0] for r in con.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'analytics' AND table_name = 'genre_pnl_template'
+          AND column_name != 'computed_at'
+        ORDER BY ordinal_position
+    """).fetchall()]
+
+    available = [c for c in tbl_cols if c in df.columns]
+    insert_df = df[available].copy()
+    con.register('_pnl_in', insert_df)
+    con.execute(f"""
+        INSERT INTO analytics.genre_pnl_template ({', '.join(available)})
+        SELECT {', '.join(available)} FROM _pnl_in
+    """)
+    con.unregister('_pnl_in')
+
+    n = len(df)
+    high = (df['opportunity_score'] == 'HIGH').sum()
+    med = (df['opportunity_score'] == 'MEDIUM').sum()
+    low = (df['opportunity_score'] == 'LOW').sum()
+    print(f"  ✓ genre_pnl_v2: {n:,} rows, {high} HIGH / {med} MEDIUM / {low} LOW")
+    con.close()
+    return df
+
+
 # ────────────────────────────────────────────────────────
 # PHASE 5: REVENUE FORECAST
 # ────────────────────────────────────────────────────────
@@ -845,6 +1104,143 @@ def compute_revenue_forecast(genre: str, country: str, os: str,
     print(f"  ✓ revenue_forecast({genre}, {country}): {len(out_df)} periods, "
           f"M0=${out_df.iloc[0]['revenue_mid_usd']:,.0f} → "
           f"M{len(out_df)-1}=${out_df.iloc[-1]['revenue_mid_usd']:,.0f}")
+    return out_df
+
+
+def compute_revenue_forecast_v2(db_path: str | None = None) -> pd.DataFrame:
+    """
+    Auto-generate revenue forecasts for all genre × market combinations.
+
+    Uses company M0-M24 revenue curves normalized to M1, with calibration
+    from composite_benchmark. Produces mid/low/high estimates with CV-based
+    confidence bands.
+    """
+    import numpy as np
+    con = _con(db_path)
+
+    # Step 1: Extract company revenue curves by genre × market
+    curves = con.execute("""
+        SELECT cg.genre, cg.market,
+               cr.m0,  cr.m1,  cr.m2,  cr.m3,  cr.m4,  cr.m5,
+               cr.m6,  cr.m7,  cr.m8,  cr.m9,  cr.m10, cr.m11,
+               cr.m12, cr.m13, cr.m14, cr.m15, cr.m16, cr.m17,
+               cr.m18, cr.m19, cr.m20, cr.m21, cr.m22, cr.m23, cr.m24
+        FROM fact.fact_company_revenue cr
+        JOIN dim.dim_company_games cg
+          ON cg.product_code = cr.product_code AND cg.market = cr.market
+        WHERE cg.genre IS NOT NULL AND cr.ob_date IS NOT NULL
+    """).df()
+
+    if curves.empty:
+        print("  ○ revenue_forecast_v2: no company revenue curves")
+        con.close()
+        return pd.DataFrame()
+
+    # Step 2: Get calibration factors from composite_benchmark
+    cal_df = con.execute("""
+        SELECT cg.genre, cb.country AS market,
+               AVG(cb.composite_mid_usd / NULLIF(cb.st_estimate_usd, 0)) AS cal_factor,
+               COUNT(*) AS sample_size
+        FROM analytics.composite_benchmark cb
+        JOIN dim.dim_company_games cg
+          ON cg.product_code = cb.product_code AND cg.market = cb.country
+        WHERE cb.accuracy_tier IN ('Accurate', 'Acceptable')
+          AND cb.st_estimate_usd > 0
+        GROUP BY cg.genre, cb.country
+    """).df()
+
+    cal_map = {}
+    for _, row in cal_df.iterrows():
+        cal_map[(row['genre'], row['market'])] = float(row['cal_factor'])
+
+    # Step 3: Determine forecast base month (latest data month + 1)
+    latest_month = con.execute("""
+        SELECT MAX(ob_date) FROM fact.fact_company_revenue WHERE ob_date IS NOT NULL
+    """).fetchone()[0]
+    if latest_month:
+        forecast_base = (pd.Timestamp(latest_month) + pd.DateOffset(months=1)).strftime('%Y-%m-%d')
+    else:
+        forecast_base = '2026-01-01'
+
+    # Step 4: Build genre-average curves
+    m_cols = [f'm{i}' for i in range(25)]
+    rows_out = []
+
+    for (genre, market), grp in curves.groupby(['genre', 'market']):
+        # Compute median of each period
+        medians = {}
+        for col in m_cols:
+            vals = grp[col].dropna()
+            vals = vals[vals > 0]
+            if len(vals) > 0:
+                medians[col] = float(vals.median())
+
+        if 'm1' not in medians or medians['m1'] <= 0:
+            continue
+
+        m1_base = medians['m1']
+        # Normalize shape to M1
+        shape = {}
+        for col in m_cols:
+            if col in medians:
+                shape[col] = medians[col] / m1_base
+
+        # CV for confidence bands
+        m1_vals = grp['m1'].dropna()
+        m1_vals = m1_vals[m1_vals > 0]
+        if len(m1_vals) >= 2:
+            cv = float(m1_vals.std() / m1_vals.mean())
+            cv = max(0.15, min(cv, 0.60))
+        else:
+            cv = 0.50  # wide band for sparse data
+
+        # Calibration factor
+        cal = cal_map.get((genre, market), 1.0)
+
+        # Get IAP% for this genre × market
+        iap = _get_iap_pct(genre, market)
+
+        for m in range(min(25, len(shape))):
+            col = f'm{m}'
+            if col not in shape:
+                break
+            rev_mid = m1_base * shape[col] * iap * cal
+            rows_out.append({
+                'genre': genre,
+                'subgenre': None,
+                'country': market,
+                'os': 'unified',
+                'forecast_month': forecast_base,
+                'period': m,
+                'revenue_mid_usd': round(rev_mid, 2),
+                'revenue_low_usd': round(rev_mid * max(0, 1 - cv), 2),
+                'revenue_high_usd': round(rev_mid * (1 + cv), 2),
+                'calibration_factor': round(cal, 4),
+            })
+
+    if not rows_out:
+        print("  ○ revenue_forecast_v2: no viable curves")
+        con.close()
+        return pd.DataFrame()
+
+    out_df = pd.DataFrame(rows_out)
+    con.execute("DELETE FROM analytics.revenue_forecast")
+    con.execute("""
+        INSERT INTO analytics.revenue_forecast
+            (genre, subgenre, country, os, forecast_month, period,
+             revenue_mid_usd, revenue_low_usd, revenue_high_usd,
+             calibration_factor, computed_at)
+        SELECT genre, subgenre, country, os, forecast_month, period,
+               revenue_mid_usd, revenue_low_usd, revenue_high_usd,
+               calibration_factor, current_timestamp
+        FROM out_df
+    """)
+
+    n = len(out_df)
+    genres = out_df['genre'].nunique()
+    markets = out_df['country'].nunique()
+    print(f"  ✓ revenue_forecast_v2: {n} rows ({genres} genres × {markets} markets)")
+    con.close()
     return out_df
 
 
@@ -2392,6 +2788,558 @@ def compute_portfolio_summary(db_path: str | None = None) -> pd.DataFrame:
     print(f"  ✓ portfolio_summary: {n:,} rows")
     con.close()
     return df
+
+
+def compute_genre_concentration(db_path: str | None = None) -> pd.DataFrame:
+    """
+    Compute genre-level concentration metrics from fact_market_insights.
+
+    For each ST category × country × month, ranks apps by revenue and computes:
+      - top1/5/10 share of total category revenue
+      - HHI proxy (sum of squared shares for top 10)
+      - concentration tier: HIGH (>0.25), MEDIUM (>0.10), LOW
+
+    Uses fact_market_insights + dim_apps (deduplicated by app_id).
+    Writes to analytics.genre_concentration.
+    """
+    con = _con(db_path)
+
+    # Build concentration from MI revenue, joining dim_apps for category.
+    # Deduplicate dim_apps: one category_id per app_id (take first non-null).
+    df = con.execute("""
+        WITH app_cat AS (
+            SELECT app_id,
+                   FIRST(category_id) AS st_category,
+                   FIRST(name)        AS app_name
+            FROM dim.dim_apps
+            WHERE category_id IS NOT NULL
+              AND category_id NOT IN ('', 'NaN', '0')
+            GROUP BY app_id
+        ),
+        rev AS (
+            SELECT ac.st_category,
+                   mi.country,
+                   mi.date       AS month,
+                   mi.app_id,
+                   ac.app_name,
+                   SUM(mi.revenue_cents) / 100.0 AS rev_usd
+            FROM fact.fact_market_insights mi
+            JOIN app_cat ac ON mi.app_id = ac.app_id
+            WHERE mi.revenue_cents > 0
+            GROUP BY 1, 2, 3, 4, 5
+        ),
+        genre_total AS (
+            SELECT st_category, country, month,
+                   SUM(rev_usd) AS genre_iap_usd,
+                   COUNT(*)     AS app_count
+            FROM rev
+            GROUP BY 1, 2, 3
+        ),
+        ranked AS (
+            SELECT r.*,
+                   gt.genre_iap_usd,
+                   gt.app_count,
+                   r.rev_usd / gt.genre_iap_usd AS share,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY r.st_category, r.country, r.month
+                       ORDER BY r.rev_usd DESC
+                   ) AS rk
+            FROM rev r
+            JOIN genre_total gt
+              ON r.st_category = gt.st_category
+             AND r.country     = gt.country
+             AND r.month       = gt.month
+            WHERE gt.genre_iap_usd > 0
+        )
+        SELECT
+            st_category,
+            country,
+            month,
+            ANY_VALUE(genre_iap_usd)  AS genre_iap_usd,
+            ANY_VALUE(app_count)      AS app_count,
+            MAX(CASE WHEN rk = 1 THEN share END)                        AS top1_share,
+            SUM(CASE WHEN rk <= 5  THEN share ELSE 0 END)               AS top5_share,
+            SUM(CASE WHEN rk <= 10 THEN share ELSE 0 END)               AS top10_share,
+            SUM(CASE WHEN rk <= 10 THEN share * share ELSE 0 END)       AS hhi_top10,
+            MAX(CASE WHEN rk = 1 THEN app_id END)                       AS top1_app_id,
+            MAX(CASE WHEN rk = 1 THEN app_name END)                     AS top1_app_name
+        FROM ranked
+        GROUP BY st_category, country, month
+        ORDER BY st_category, country, month
+    """).df()
+
+    if df.empty:
+        print("  ○ genre_concentration: no data produced")
+        con.close()
+        return df
+
+    # Convert shares to percentages and assign tier
+    for col in ['top1_share', 'top5_share', 'top10_share']:
+        df[col + '_pct'] = df[col] * 100
+    df['concentration_tier'] = df['hhi_top10'].apply(
+        lambda h: 'HIGH' if h > 0.25 else ('MEDIUM' if h > 0.10 else 'LOW')
+    )
+
+    # Upsert
+    out = df[['st_category', 'country', 'month', 'genre_iap_usd',
+              'top1_share_pct', 'top5_share_pct', 'top10_share_pct',
+              'hhi_top10', 'concentration_tier', 'app_count',
+              'top1_app_id', 'top1_app_name']].copy()
+    con.register('_gc_in', out)
+    con.execute("DELETE FROM analytics.genre_concentration")
+    con.execute("""
+        INSERT INTO analytics.genre_concentration
+            (st_category, country, month, genre_iap_usd,
+             top1_share_pct, top5_share_pct, top10_share_pct,
+             hhi_top10, concentration_tier, app_count,
+             top1_app_id, top1_app_name)
+        SELECT st_category, country, month, genre_iap_usd,
+               top1_share_pct, top5_share_pct, top10_share_pct,
+               hhi_top10, concentration_tier, app_count,
+               top1_app_id, top1_app_name
+        FROM _gc_in
+    """)
+    con.unregister('_gc_in')
+
+    n = con.execute("SELECT COUNT(*) FROM analytics.genre_concentration").fetchone()[0]
+    cats = con.execute(
+        "SELECT COUNT(DISTINCT st_category) FROM analytics.genre_concentration"
+    ).fetchone()[0]
+    countries = con.execute(
+        "SELECT COUNT(DISTINCT country) FROM analytics.genre_concentration"
+    ).fetchone()[0]
+    print(f"  ✓ genre_concentration: {n:,} rows ({cats} categories × {countries} countries)")
+    con.close()
+    return out
+
+
+def compute_game_pnl(db_path: str | None = None) -> pd.DataFrame:
+    """
+    Per-game PnL combining market share position, genre TAM context,
+    concentration, forecast, and LTV into a single actionable view.
+
+    Reads from analytics.market_share + genre_concentration + genre_pnl_template
+    + revenue_forecast + ltv_model. Writes to analytics.game_pnl.
+    """
+    con = _con(db_path)
+
+    check = con.execute("SELECT COUNT(*) FROM analytics.market_share").fetchone()[0]
+    if check == 0:
+        print("  ○ game_pnl: market_share empty — run compute_market_share() first")
+        con.close()
+        return pd.DataFrame()
+
+    # Build genre → ST category mapping as SQL CASE (escape single quotes)
+    genre_case = "CASE LOWER(TRIM(ms.genre))\n"
+    for g, cat in _GENRE_TO_ST_CATEGORY.items():
+        g_escaped = g.replace("'", "''")
+        genre_case += f"            WHEN '{g_escaped}' THEN '{cat}'\n"
+    genre_case += "            ELSE NULL END"
+
+    df = con.execute(f"""
+        WITH ms_data AS (
+            SELECT ms.*,
+                   {genre_case} AS st_category
+            FROM analytics.market_share ms
+        ),
+        launch AS (
+            SELECT product_code, market, MIN(ob_date) AS launch_date
+            FROM fact.fact_company_revenue
+            WHERE ob_date IS NOT NULL
+            GROUP BY product_code, market
+        ),
+        -- Map company market → primary ST country for concentration join
+        market_country AS (
+            SELECT DISTINCT market,
+                   CASE market
+                       WHEN 'Vietnam'     THEN 'VN'
+                       WHEN 'ThaiLand'    THEN 'TH'
+                       WHEN 'Philippines' THEN 'PH'
+                       WHEN 'Indonesia'   THEN 'ID'
+                       WHEN 'Sing-Malay'  THEN 'SG'
+                       WHEN 'TW-HK'       THEN 'TW'
+                       WHEN 'Global'      THEN 'VN'
+                   END AS primary_country
+            FROM analytics.market_share
+        ),
+        gc AS (
+            SELECT st_category, country, month,
+                   hhi_top10, concentration_tier
+            FROM analytics.genre_concentration
+        ),
+        ltv AS (
+            SELECT genre, country,
+                   AVG(CASE WHEN period <= 3 THEN ltv_usd END) AS ltv_90
+            FROM analytics.ltv_model
+            GROUP BY genre, country
+        )
+        SELECT
+            md.product_code,
+            md.product_name,
+            md.genre,
+            md.market,
+            md.month            AS report_month,
+            md.company_gross_usd,
+            md.company_iap_usd,
+            md.market_share_pct,
+            md.portfolio_rank,
+            md.genre_iap_usd    AS genre_tam_usd,
+            gc.hhi_top10        AS hhi_score,
+            gc.concentration_tier,
+            DATEDIFF('month', l.launch_date, md.month) AS months_since_launch,
+            md.trend_3m_pp      AS share_trend_3m_pp,
+            ltv.ltv_90          AS ltv_90_usd
+        FROM ms_data md
+        LEFT JOIN market_country mc ON mc.market = md.market
+        LEFT JOIN gc ON gc.st_category = md.st_category
+            AND gc.country = mc.primary_country
+            AND gc.month = md.month
+        LEFT JOIN launch l ON l.product_code = md.product_code AND l.market = md.market
+        LEFT JOIN ltv ON ltv.genre = md.st_category AND ltv.country = mc.primary_country
+    """).df()
+
+    if df.empty:
+        print("  ○ game_pnl: no rows produced")
+        con.close()
+        return df
+
+    # Revenue trend 3m (% change in own gross vs 3 months prior)
+    df = df.sort_values(['product_code', 'market', 'report_month'])
+    df['revenue_trend_3m'] = (
+        df.groupby(['product_code', 'market'])['company_gross_usd']
+          .transform(lambda s: (s - s.shift(3)) / s.shift(3).replace(0, float('nan')))
+    )
+
+    # TAM growth from genre_pnl_template (latest available)
+    tam_growth = con.execute("""
+        SELECT genre AS st_category, country,
+               AVG(tam_growth_3m) AS tam_growth_3m
+        FROM analytics.genre_pnl_template
+        WHERE tam_growth_3m IS NOT NULL
+        GROUP BY genre, country
+    """).df()
+
+    # Map market → primary country for TAM growth join
+    market_map = {
+        'Vietnam': 'VN', 'ThaiLand': 'TH', 'Philippines': 'PH',
+        'Indonesia': 'ID', 'Sing-Malay': 'SG', 'TW-HK': 'TW', 'Global': 'VN'
+    }
+    df['_primary_country'] = df['market'].map(market_map)
+    df['_st_cat'] = df['genre'].str.lower().str.strip().map(_GENRE_TO_ST_CATEGORY)
+
+    if not tam_growth.empty:
+        tam_map = tam_growth.set_index(['st_category', 'country'])['tam_growth_3m'].to_dict()
+        df['tam_growth_3m'] = df.apply(
+            lambda r: tam_map.get((r['_st_cat'], r['_primary_country'])), axis=1
+        )
+    else:
+        df['tam_growth_3m'] = None
+
+    # Join forecast data
+    forecast = con.execute("""
+        SELECT genre, country, period,
+               revenue_mid_usd AS forecast_mid_usd,
+               revenue_low_usd AS forecast_low_usd,
+               revenue_high_usd AS forecast_high_usd
+        FROM analytics.revenue_forecast
+    """).df()
+
+    if not forecast.empty:
+        fc_map = {}
+        for _, r in forecast.iterrows():
+            fc_map[(r['genre'], r['country'], int(r['period']))] = (
+                r['forecast_mid_usd'], r['forecast_low_usd'], r['forecast_high_usd']
+            )
+        df['_msl'] = df['months_since_launch'].fillna(-1).astype(int)
+        df['forecast_mid_usd'] = df.apply(
+            lambda r: fc_map.get((r['genre'], r['market'], r['_msl']), (None,))[0], axis=1
+        )
+        df['forecast_low_usd'] = df.apply(
+            lambda r: fc_map.get((r['genre'], r['market'], r['_msl']), (None, None))[1], axis=1
+        )
+        df['forecast_high_usd'] = df.apply(
+            lambda r: fc_map.get((r['genre'], r['market'], r['_msl']), (None, None, None))[2], axis=1
+        )
+    else:
+        df['forecast_mid_usd'] = None
+        df['forecast_low_usd'] = None
+        df['forecast_high_usd'] = None
+
+    # Opportunity score per game
+    def _game_score(row) -> str:
+        share_trend = row.get('share_trend_3m_pp')
+        tam_growth = row.get('tam_growth_3m')
+        hhi = row.get('hhi_score') or 0
+        if (pd.notna(share_trend) and share_trend > 0
+                and pd.notna(tam_growth) and tam_growth > 0
+                and hhi < 0.25):
+            return 'HIGH'
+        if ((pd.notna(share_trend) and share_trend < -2)
+                or (pd.notna(tam_growth) and tam_growth < -0.05)
+                or hhi > 0.50):
+            return 'LOW'
+        return 'MEDIUM'
+
+    df['opportunity_score'] = df.apply(_game_score, axis=1)
+
+    # Write to analytics.game_pnl
+    out_cols = [
+        'product_code', 'product_name', 'genre', 'market', 'report_month',
+        'company_gross_usd', 'company_iap_usd',
+        'market_share_pct', 'portfolio_rank',
+        'genre_tam_usd', 'tam_growth_3m', 'hhi_score', 'concentration_tier',
+        'forecast_mid_usd', 'forecast_low_usd', 'forecast_high_usd',
+        'months_since_launch', 'revenue_trend_3m', 'share_trend_3m_pp',
+        'ltv_90_usd', 'opportunity_score',
+    ]
+    out_df = df[out_cols].copy()
+
+    con.register('_gpnl_in', out_df)
+    con.execute("DELETE FROM analytics.game_pnl")
+    con.execute(f"""
+        INSERT INTO analytics.game_pnl ({', '.join(out_cols)})
+        SELECT {', '.join(out_cols)} FROM _gpnl_in
+    """)
+    con.unregister('_gpnl_in')
+
+    n = len(out_df)
+    games = out_df['product_code'].nunique()
+    high = (out_df['opportunity_score'] == 'HIGH').sum()
+    med = (out_df['opportunity_score'] == 'MEDIUM').sum()
+    low = (out_df['opportunity_score'] == 'LOW').sum()
+    print(f"  ✓ game_pnl: {n:,} rows ({games} games), "
+          f"{high} HIGH / {med} MEDIUM / {low} LOW")
+    con.close()
+    return out_df
+
+
+# ────────────────────────────────────────────────────────
+# REPORTING
+# ────────────────────────────────────────────────────────
+
+def generate_reports(output_dir: str | None = None, db_path: str | None = None) -> str:
+    """
+    Generate a multi-sheet Excel report from all analytics tables.
+
+    Sheets:
+      1. Executive Summary — top games, genre opportunities, key metrics
+      2. Game PnL — per-game PnL with opportunity scores (latest 6 months)
+      3. Market Share — per-game market share trends
+      4. Genre PnL — genre-level TAM, growth, concentration (SEA, latest 12 months)
+      5. Genre Concentration — HHI and structure per genre×country
+      6. Revenue Forecast — M0-M24 curves per genre×market
+      7. Portfolio Summary — genre×market aggregation
+      8. Data Quality — mapping coverage and gaps
+
+    Returns path to the generated file.
+    """
+    from pathlib import Path
+    from datetime import datetime
+
+    con = _con(db_path)
+    out_dir = Path(output_dir) if output_dir else Path(__file__).parent / 'reports'
+    out_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+    out_path = out_dir / f'market_intelligence_{timestamp}.xlsx'
+
+    sea_countries = ('VN', 'TH', 'ID', 'PH', 'SG', 'MY', 'TW', 'HK')
+
+    # ── Sheet 1: Executive Summary ──────────────────────────
+    exec_summary = con.execute(f"""
+        SELECT
+            product_name AS "Game",
+            market AS "Market",
+            genre AS "Genre",
+            COUNT(*) FILTER (WHERE opportunity_score = 'HIGH') AS "HIGH Months",
+            ROUND(AVG(company_gross_usd)) AS "Avg Monthly Gross ($)",
+            ROUND(AVG(market_share_pct), 2) AS "Avg Market Share (%)",
+            ROUND(AVG(hhi_score), 4) AS "Avg HHI",
+            MAX(concentration_tier) AS "Concentration",
+            ROUND(AVG(tam_growth_3m) * 100, 1) AS "Avg TAM Growth (%)"
+        FROM analytics.game_pnl
+        WHERE company_gross_usd > 0
+        GROUP BY 1, 2, 3
+        ORDER BY "Avg Monthly Gross ($)" DESC NULLS LAST
+    """).df()
+
+    # ── Sheet 2: Game PnL (latest 6 months) ─────────────────
+    game_pnl = con.execute("""
+        SELECT
+            product_name AS "Game",
+            genre AS "Genre",
+            market AS "Market",
+            report_month AS "Month",
+            ROUND(company_gross_usd) AS "Gross ($)",
+            ROUND(company_iap_usd) AS "IAP ($)",
+            ROUND(market_share_pct, 2) AS "Market Share (%)",
+            portfolio_rank AS "Rank",
+            ROUND(genre_tam_usd) AS "Genre TAM ($)",
+            ROUND(tam_growth_3m * 100, 1) AS "TAM Growth 3m (%)",
+            ROUND(hhi_score, 4) AS "HHI",
+            concentration_tier AS "Concentration",
+            ROUND(share_trend_3m_pp, 2) AS "Share Trend 3m (pp)",
+            ROUND(revenue_trend_3m * 100, 1) AS "Rev Trend 3m (%)",
+            months_since_launch AS "Months Live",
+            ROUND(forecast_mid_usd) AS "Forecast Mid ($)",
+            opportunity_score AS "Opportunity"
+        FROM analytics.game_pnl
+        WHERE report_month >= (
+            SELECT MAX(report_month) - INTERVAL '6 months' FROM analytics.game_pnl
+        )
+        ORDER BY report_month DESC, company_gross_usd DESC NULLS LAST
+    """).df()
+
+    # ── Sheet 3: Market Share ───────────────────────────────
+    market_share = con.execute("""
+        SELECT
+            product_name AS "Game",
+            genre AS "Genre",
+            market AS "Market",
+            month AS "Month",
+            ROUND(company_gross_usd) AS "Gross ($)",
+            ROUND(company_iap_usd) AS "IAP ($)",
+            ROUND(market_share_pct, 2) AS "Genre Share (%)",
+            ROUND(store_share_pct, 4) AS "Store Share (%)",
+            portfolio_rank AS "Rank",
+            ROUND(trend_3m_pp, 2) AS "Trend 3m (pp)"
+        FROM analytics.market_share
+        ORDER BY month DESC, company_gross_usd DESC NULLS LAST
+    """).df()
+
+    # ── Sheet 4: Genre PnL (SEA, latest 12 months) ─────────
+    genre_pnl = con.execute(f"""
+        SELECT
+            genre AS "Genre",
+            country AS "Country",
+            report_month AS "Month",
+            ROUND(tam_usd) AS "Store TAM ($)",
+            ROUND(genre_tam_usd) AS "Genre TAM ($)",
+            ROUND(genre_revenue_share * 100, 2) AS "Genre Share of Store (%)",
+            ROUND(tam_growth_3m * 100, 1) AS "TAM Growth 3m (%)",
+            ROUND(hhi_score, 4) AS "HHI",
+            concentration_tier AS "Concentration",
+            ROUND(ltv_30, 4) AS "LTV 30d ($)",
+            ROUND(ltv_90, 4) AS "LTV 90d ($)",
+            ROUND(d1_retention, 1) AS "D1 Ret (%)",
+            ROUND(d30_retention, 1) AS "D30 Ret (%)",
+            opportunity_score AS "Opportunity"
+        FROM analytics.genre_pnl_template
+        WHERE country IN {sea_countries}
+          AND report_month >= (
+              SELECT MAX(report_month) - INTERVAL '12 months'
+              FROM analytics.genre_pnl_template
+          )
+        ORDER BY country, genre, report_month DESC
+    """).df()
+
+    # ── Sheet 5: Genre Concentration ────────────────────────
+    concentration = con.execute(f"""
+        SELECT
+            st_category AS "Genre",
+            country AS "Country",
+            month AS "Month",
+            ROUND(genre_iap_usd) AS "Genre Revenue ($)",
+            app_count AS "Apps",
+            ROUND(top1_share_pct, 1) AS "Top 1 Share (%)",
+            ROUND(top5_share_pct, 1) AS "Top 5 Share (%)",
+            ROUND(top10_share_pct, 1) AS "Top 10 Share (%)",
+            ROUND(hhi_top10, 4) AS "HHI (Top 10)",
+            concentration_tier AS "Tier",
+            top1_app_name AS "Top App"
+        FROM analytics.genre_concentration
+        WHERE country IN {sea_countries}
+          AND month >= (
+              SELECT MAX(month) - INTERVAL '6 months'
+              FROM analytics.genre_concentration
+          )
+        ORDER BY country, st_category, month DESC
+    """).df()
+
+    # ── Sheet 6: Revenue Forecast ───────────────────────────
+    forecast = con.execute("""
+        SELECT
+            genre AS "Genre",
+            country AS "Market",
+            period AS "Period (M)",
+            ROUND(revenue_mid_usd) AS "Forecast Mid ($)",
+            ROUND(revenue_low_usd) AS "Forecast Low ($)",
+            ROUND(revenue_high_usd) AS "Forecast High ($)",
+            calibration_factor AS "Calibration Factor"
+        FROM analytics.revenue_forecast
+        ORDER BY genre, country, period
+    """).df()
+
+    # ── Sheet 7: Portfolio Summary ──────────────────────────
+    portfolio = con.execute("""
+        SELECT
+            genre AS "Genre",
+            market AS "Market",
+            month AS "Month",
+            game_count AS "Games",
+            ROUND(total_company_gross_usd) AS "Portfolio Gross ($)",
+            ROUND(total_company_iap_usd) AS "Portfolio IAP ($)",
+            ROUND(genre_iap_usd) AS "Genre TAM ($)",
+            ROUND(portfolio_share_pct, 2) AS "Portfolio Share (%)",
+            top_game_name AS "Top Game",
+            ROUND(top_game_share_pct, 2) AS "Top Game Share (%)",
+            ROUND(trend_3m_pp, 2) AS "Trend 3m (pp)"
+        FROM analytics.portfolio_summary
+        ORDER BY genre, market, month DESC
+    """).df()
+
+    # ── Sheet 8: Data Quality ───────────────────────────────
+    data_quality = con.execute("""
+        SELECT
+            'Mapping Coverage' AS "Metric",
+            CONCAT(
+                COUNT(CASE WHEN unified_app_id IS NOT NULL THEN 1 END),
+                '/', COUNT(*), ' games mapped (',
+                ROUND(COUNT(CASE WHEN unified_app_id IS NOT NULL THEN 1 END) * 100.0 / COUNT(*), 1),
+                '%)'
+            ) AS "Value"
+        FROM dim.dim_company_games
+        UNION ALL
+        SELECT 'Market Share Rows', CONCAT(COUNT(*), ' total') FROM analytics.market_share
+        UNION ALL
+        SELECT 'With Genre Share', CONCAT(COUNT(*), ' rows')
+        FROM analytics.market_share WHERE market_share_pct IS NOT NULL
+        UNION ALL
+        SELECT 'Null Genre Denom', CONCAT(COUNT(*), ' rows')
+        FROM analytics.market_share WHERE genre_iap_usd IS NULL
+        UNION ALL
+        SELECT 'Over 100% (nulled)', CONCAT(COUNT(*), ' rows')
+        FROM analytics.market_share WHERE market_share_pct IS NULL AND genre_iap_usd IS NOT NULL
+        UNION ALL
+        SELECT 'MI Data Latest', MAX(date)::VARCHAR
+        FROM fact.fact_market_insights WHERE revenue_cents > 0
+        UNION ALL
+        SELECT 'Genre Concentration Rows', CONCAT(COUNT(*), ' rows')
+        FROM analytics.genre_concentration
+        UNION ALL
+        SELECT 'Game PnL Rows', CONCAT(COUNT(*), ' rows') FROM analytics.game_pnl
+        UNION ALL
+        SELECT 'Revenue Forecast Rows', CONCAT(COUNT(*), ' rows') FROM analytics.revenue_forecast
+        UNION ALL
+        SELECT 'LTV Model Rows', CONCAT(COUNT(*), ' rows') FROM analytics.ltv_model
+    """).df()
+
+    con.close()
+
+    # ── Write Excel ─────────────────────────────────────────
+    with pd.ExcelWriter(str(out_path), engine='openpyxl') as writer:
+        exec_summary.to_excel(writer, sheet_name='Executive Summary', index=False)
+        game_pnl.to_excel(writer, sheet_name='Game PnL', index=False)
+        market_share.to_excel(writer, sheet_name='Market Share', index=False)
+        genre_pnl.to_excel(writer, sheet_name='Genre PnL', index=False)
+        concentration.to_excel(writer, sheet_name='Genre Concentration', index=False)
+        forecast.to_excel(writer, sheet_name='Revenue Forecast', index=False)
+        portfolio.to_excel(writer, sheet_name='Portfolio Summary', index=False)
+        data_quality.to_excel(writer, sheet_name='Data Quality', index=False)
+
+    print(f"  ✓ Report generated: {out_path}")
+    print(f"    Sheets: Executive Summary | Game PnL | Market Share | Genre PnL")
+    print(f"            Genre Concentration | Revenue Forecast | Portfolio Summary | Data Quality")
+    return str(out_path)
 
 
 # ────────────────────────────────────────────────────────

@@ -228,11 +228,13 @@ def cmd_genre_assign():
 
 def cmd_analytics_market():
     print("\n=== Analytics: Market Share & Competitive Position ===")
-    from analytics import compute_market_share, compute_portfolio_summary
+    from analytics import compute_market_share, compute_portfolio_summary, compute_genre_concentration
     print("── Market Share ──")
     compute_market_share()
     print("── Portfolio Summary ──")
     compute_portfolio_summary()
+    print("── Genre Concentration ──")
+    compute_genre_concentration()
     print("\n✓ Market share analytics completed.")
 
 
@@ -281,11 +283,44 @@ def cmd_analytics_v2():
     compute_composite_benchmark()
 
     print("── Phase 7: Market Share ──")
-    from analytics import compute_market_share, compute_portfolio_summary
+    from analytics import compute_market_share, compute_portfolio_summary, compute_genre_concentration
     compute_market_share()
     compute_portfolio_summary()
+    compute_genre_concentration()
+
+    print("── Phase 8: PnL / Forecasting ──")
+    cmd_pnl()
 
     print("\n✓ Analytics v2 completed.")
+
+
+# ── PnL / Forecasting ─────────────────────────────────────────────────────────
+
+def cmd_pnl():
+    print("\n=== PnL / Forecasting ===")
+    from analytics import (
+        compute_ltv_model_v2,
+        compute_genre_pnl_v2,
+        compute_revenue_forecast_v2,
+        compute_game_pnl,
+    )
+    print("── LTV Model v2 ──")
+    compute_ltv_model_v2()
+    print("── Genre PnL v2 ──")
+    compute_genre_pnl_v2()
+    print("── Revenue Forecast v2 ──")
+    compute_revenue_forecast_v2()
+    print("── Game PnL ──")
+    compute_game_pnl()
+    print("\n✓ PnL / Forecasting completed.")
+
+
+# ── Reporting ──────────────────────────────────────────────────────────────────
+
+def cmd_report():
+    print("\n=== Generating Reports ===")
+    from analytics import generate_reports
+    generate_reports()
 
 
 # ── Phase 3-6: Analytics ─────────────────────────────────────────────────────
@@ -346,7 +381,7 @@ def main():
                             'init', 'import', 'st-files', 'extract',
                             'extract-charts', 'extract-apple',
                             'analytics', 'analytics-v2', 'analytics-market',
-                            'genre-assign', 'status', 'all',
+                            'pnl', 'report', 'genre-assign', 'status', 'all',
                         ],
                         help="Command to run")
     args = parser.parse_args()
@@ -361,6 +396,8 @@ def main():
         'analytics': cmd_analytics,
         'analytics-v2': cmd_analytics_v2,
         'analytics-market': cmd_analytics_market,
+        'pnl': cmd_pnl,
+        'report': cmd_report,
         'genre-assign': cmd_genre_assign,
         'status': cmd_status,
         'all': cmd_all,

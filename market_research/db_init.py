@@ -497,12 +497,61 @@ def init_db(db_path: str | None = None) -> duckdb.DuckDBPyConnection:
         )
     """)
 
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS analytics.genre_concentration (
+            st_category         VARCHAR,           -- ST category_id (e.g. 'RPG', 'Action')
+            country             VARCHAR,           -- ST country code
+            month               DATE,
+            genre_iap_usd       DOUBLE,            -- total category revenue this month
+            top1_share_pct      DOUBLE,            -- top app's share of category revenue
+            top5_share_pct      DOUBLE,            -- top 5 combined share
+            top10_share_pct     DOUBLE,            -- top 10 combined share
+            hhi_top10           DOUBLE,            -- HHI proxy: sum((rev_i/total)^2) for top 10
+            concentration_tier  VARCHAR,           -- 'HIGH' (>0.25), 'MEDIUM' (>0.10), 'LOW'
+            app_count           INTEGER,           -- total apps with revenue in this category
+            top1_app_id         VARCHAR,           -- app_id of highest-revenue app
+            top1_app_name       VARCHAR,
+            computed_at         TIMESTAMP DEFAULT current_timestamp,
+            UNIQUE(st_category, country, month)
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS analytics.game_pnl (
+            product_code        VARCHAR NOT NULL,
+            product_name        VARCHAR,
+            genre               VARCHAR,
+            market              VARCHAR NOT NULL,
+            report_month        DATE NOT NULL,
+            company_gross_usd   DOUBLE,
+            company_iap_usd     DOUBLE,
+            market_share_pct    DOUBLE,
+            portfolio_rank      INTEGER,
+            genre_tam_usd       DOUBLE,
+            tam_growth_3m       DOUBLE,
+            hhi_score           DOUBLE,
+            concentration_tier  VARCHAR,
+            forecast_mid_usd    DOUBLE,
+            forecast_low_usd    DOUBLE,
+            forecast_high_usd   DOUBLE,
+            months_since_launch INTEGER,
+            revenue_trend_3m    DOUBLE,
+            share_trend_3m_pp   DOUBLE,
+            ltv_90_usd          DOUBLE,
+            opportunity_score   VARCHAR,
+            computed_at         TIMESTAMP DEFAULT current_timestamp,
+            UNIQUE(product_code, market, report_month)
+        )
+    """)
+
     # Safe column migrations for existing databases
     for stmt in [
         "ALTER TABLE dim.dim_company_games ADD COLUMN IF NOT EXISTS genre VARCHAR",
         "ALTER TABLE dim.dim_company_games ADD COLUMN IF NOT EXISTS iap_pct_override DOUBLE",
         "ALTER TABLE dim.dim_company_games ADD COLUMN IF NOT EXISTS benchmark_valid_to DATE",
         "ALTER TABLE analytics.benchmark_accuracy ADD COLUMN IF NOT EXISTS iap_pct DOUBLE",
+        "ALTER TABLE analytics.genre_pnl_template ADD COLUMN IF NOT EXISTS tam_growth_3m DOUBLE",
+        "ALTER TABLE analytics.genre_pnl_template ADD COLUMN IF NOT EXISTS concentration_tier VARCHAR",
     ]:
         con.execute(stmt)
 
