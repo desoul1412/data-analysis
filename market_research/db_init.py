@@ -453,6 +453,50 @@ def init_db(db_path: str | None = None) -> duckdb.DuckDBPyConnection:
         )
     """)
 
+    # ══════════════════════════════════════════
+    # ANALYTICS (Phase 7 — market share)
+    # ══════════════════════════════════════════
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS analytics.market_share (
+            product_code        VARCHAR,
+            product_name        VARCHAR,
+            genre               VARCHAR,
+            market              VARCHAR,           -- company market name (e.g. 'Vietnam')
+            month               DATE,
+            company_gross_usd   DOUBLE,            -- raw company revenue (web + IAP)
+            company_iap_usd     DOUBLE,            -- gross × IAP_PCT (ST-comparable)
+            iap_pct             DOUBLE,            -- IAP fraction applied
+            genre_iap_usd       DOUBLE,            -- genre total IAP from ST flat files
+            market_share_pct    DOUBLE,            -- company_iap / genre_iap × 100
+            store_iap_usd       DOUBLE,            -- total app store IAP (from fact_store_summary, NULLable)
+            store_share_pct     DOUBLE,            -- company_iap / store_iap × 100 (NULLable)
+            portfolio_rank      INTEGER,           -- rank among company games in same genre×market×month
+            trend_3m_pp         DOUBLE,            -- market_share_pct delta vs 3 months prior (pp)
+            computed_at         TIMESTAMP DEFAULT current_timestamp,
+            UNIQUE(product_code, market, month)
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS analytics.portfolio_summary (
+            genre               VARCHAR,
+            market              VARCHAR,
+            month               DATE,
+            total_company_gross_usd  DOUBLE,       -- sum of all company games gross
+            total_company_iap_usd    DOUBLE,       -- sum of all company games IAP-equivalent
+            genre_iap_usd            DOUBLE,       -- genre total from ST data
+            portfolio_share_pct      DOUBLE,       -- total_company_iap / genre_iap × 100
+            game_count               INTEGER,      -- number of active company games this month
+            top_game_code            VARCHAR,      -- product_code of highest-revenue game
+            top_game_name            VARCHAR,
+            top_game_share_pct       DOUBLE,       -- top game's market share
+            trend_3m_pp              DOUBLE,       -- portfolio share delta vs 3 months prior
+            computed_at         TIMESTAMP DEFAULT current_timestamp,
+            UNIQUE(genre, market, month)
+        )
+    """)
+
     # Safe column migrations for existing databases
     for stmt in [
         "ALTER TABLE dim.dim_company_games ADD COLUMN IF NOT EXISTS genre VARCHAR",

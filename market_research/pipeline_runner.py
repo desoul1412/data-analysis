@@ -224,6 +224,18 @@ def cmd_genre_assign():
     auto_assign_genres()
 
 
+# ── Analytics: Market Share & Competitive Position ───────────────────────────
+
+def cmd_analytics_market():
+    print("\n=== Analytics: Market Share & Competitive Position ===")
+    from analytics import compute_market_share, compute_portfolio_summary
+    print("── Market Share ──")
+    compute_market_share()
+    print("── Portfolio Summary ──")
+    compute_portfolio_summary()
+    print("\n✓ Market share analytics completed.")
+
+
 # ── Analytics v2 (benchmark accuracy improvement) ────────────────────────────
 
 def cmd_analytics_v2():
@@ -267,6 +279,11 @@ def cmd_analytics_v2():
 
     print("── Task 6: Composite Benchmark ──")
     compute_composite_benchmark()
+
+    print("── Phase 7: Market Share ──")
+    from analytics import compute_market_share, compute_portfolio_summary
+    compute_market_share()
+    compute_portfolio_summary()
 
     print("\n✓ Analytics v2 completed.")
 
@@ -328,8 +345,8 @@ def main():
     parser.add_argument('command', choices=[
                             'init', 'import', 'st-files', 'extract',
                             'extract-charts', 'extract-apple',
-                            'analytics', 'analytics-v2', 'genre-assign',
-                            'status', 'all',
+                            'analytics', 'analytics-v2', 'analytics-market',
+                            'genre-assign', 'status', 'all',
                         ],
                         help="Command to run")
     args = parser.parse_args()
@@ -343,6 +360,7 @@ def main():
         'extract-apple': cmd_extract_apple,
         'analytics': cmd_analytics,
         'analytics-v2': cmd_analytics_v2,
+        'analytics-market': cmd_analytics_market,
         'genre-assign': cmd_genre_assign,
         'status': cmd_status,
         'all': cmd_all,

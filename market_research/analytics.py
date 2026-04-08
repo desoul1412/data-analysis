@@ -2084,6 +2084,317 @@ def auto_assign_genres(dry_run: bool = False, db_path: str | None = None) -> pd.
 
 
 # ────────────────────────────────────────────────────────
+# PHASE 7: MARKET SHARE & COMPETITIVE POSITION
+# ────────────────────────────────────────────────────────
+
+# Maps company genre labels (lowercase) → ST dim_apps.category_id values.
+# Used to compute genre-level denominators from fact_market_insights.
+_GENRE_TO_ST_CATEGORY: dict[str, str] = {
+    'mmorpg':               'RPG',
+    'turn-based rpg':       'RPG',
+    'idle rpg':             'RPG',
+    'squad rpg':            'RPG',
+    'idler':                'Simulation',
+    'moba':                 'Action',
+    "shoot 'em up":         'Shooter',
+    'shooting':             'Shooter',
+    'artillery shooter':    'Shooter',
+    'fps / 3ps':            'Shooter',
+    'platformer / runner':  'Arcade',
+    'other arcade':         'Arcade',
+    'tycoon / crafting':    'Simulation',
+    'battle royale':        'Action',
+    'team battle':          'Action',
+    'avatar life':          'Social',
+    'sports manager':       'Sports',
+}
+
+
+def compute_market_share(db_path: str | None = None) -> pd.DataFrame:
+    """
+    Compute each company game's % share of its genre's total IAP-equivalent market.
+
+    Numerator:   company gross × IAP_PCT per calendar month (all 155 games).
+    Denominator: sum of fact_market_insights revenue for apps in matching ST
+                 category per market per calendar month (ST flat-file universe).
+    Store share: company_iap / fact_store_summary total (where available, 5-month window).
+
+    Writes to analytics.market_share.
+    """
+    con = _con(db_path)
+
+    # ── Step 1: Unpivot all company revenue to calendar months ───────────────
+    rev_wide = con.execute("""
+        SELECT cr.product_code, cr.market, cr.ob_date,
+               cg.product_name, cg.genre, cg.iap_pct_override,
+               cr.m0,  cr.m1,  cr.m2,  cr.m3,  cr.m4,  cr.m5,
+               cr.m6,  cr.m7,  cr.m8,  cr.m9,  cr.m10, cr.m11,
+               cr.m12, cr.m13, cr.m14, cr.m15, cr.m16, cr.m17,
+               cr.m18, cr.m19, cr.m20, cr.m21, cr.m22, cr.m23,
+               cr.m24, cr.m25, cr.m26, cr.m27, cr.m28, cr.m29,
+               cr.m30, cr.m31, cr.m32, cr.m33, cr.m34, cr.m35, cr.m36
+        FROM fact.fact_company_revenue cr
+        JOIN dim.dim_company_games cg
+          ON cg.product_code = cr.product_code AND cg.market = cr.market
+        WHERE cr.ob_date IS NOT NULL
+    """).df()
+
+    if rev_wide.empty:
+        print("  ○ compute_market_share: no company revenue found")
+        con.close()
+        return rev_wide
+
+    id_cols = ['product_code', 'product_name', 'market', 'genre', 'iap_pct_override', 'ob_date']
+    m_cols = [f'm{i}' for i in range(37) if f'm{i}' in rev_wide.columns]
+    rev_long = rev_wide.melt(id_vars=id_cols, value_vars=m_cols,
+                              var_name='period_label', value_name='gross_usd')
+    rev_long = rev_long[rev_long['gross_usd'].notna() & (rev_long['gross_usd'] > 0)].copy()
+    rev_long['period_n'] = rev_long['period_label'].str[1:].astype(int)
+    rev_long['ob_date'] = pd.to_datetime(rev_long['ob_date'], errors='coerce')
+    rev_long = rev_long[rev_long['ob_date'].notna()].copy()
+    rev_long['calendar_month'] = (
+        rev_long['ob_date'].dt.to_period('M') + rev_long['period_n']
+    ).dt.to_timestamp().dt.date
+
+    # ── Step 2: Apply IAP_PCT per game × market ───────────────────────────────
+    def _iap(row) -> float:
+        if pd.notna(row['iap_pct_override']) and row['iap_pct_override'] > 0:
+            return float(row['iap_pct_override'])
+        return _get_iap_pct(row['genre'], row['market'])
+
+    rev_long['iap_pct'] = rev_long.apply(_iap, axis=1)
+    rev_long['company_iap_usd'] = rev_long['gross_usd'] * rev_long['iap_pct']
+
+    # ── Step 3: Genre → ST category mapping ──────────────────────────────────
+    rev_long['st_category'] = (
+        rev_long['genre'].str.lower().str.strip().map(_GENRE_TO_ST_CATEGORY)
+    )
+
+    # ── Step 4: Genre IAP totals from fact_market_insights + dim_apps ────────
+    # Pre-build for all SEA countries at once; we'll aggregate by market after.
+    genre_totals = con.execute("""
+        SELECT da.category_id  AS st_category,
+               mi.country,
+               mi.date         AS month,
+               SUM(mi.revenue_cents) / 100.0 AS genre_iap_usd
+        FROM fact.fact_market_insights mi
+        JOIN dim.dim_apps da ON mi.app_id = da.app_id
+        WHERE mi.country IN ('VN','TH','ID','PH','SG','MY','TW','HK','WW')
+          AND da.category_id IS NOT NULL
+          AND da.category_id NOT IN ('', 'NaN')
+        GROUP BY 1, 2, 3
+    """).df()
+    genre_totals['month'] = pd.to_datetime(genre_totals['month']).dt.date
+
+    # ── Step 5: Store IAP totals from fact_store_summary ─────────────────────
+    store_totals = con.execute("""
+        SELECT country, date AS month, revenue_cents / 100.0 AS store_iap_usd
+        FROM fact.fact_store_summary
+    """).df()
+    store_totals['month'] = pd.to_datetime(store_totals['month']).dt.date
+
+    # ── Step 6: Join company revenue to genre and store denominators ──────────
+    rows_out = []
+    for _, row in rev_long.iterrows():
+        market   = row['market']
+        st_cat   = row['st_category']
+        month    = row['calendar_month']
+        countries = COMPANY_MARKET_ST_COUNTRIES.get(market, [])
+
+        # Genre denominator: sum across all constituent countries
+        genre_iap = None
+        if st_cat and countries:
+            subset = genre_totals[
+                (genre_totals['st_category'] == st_cat) &
+                (genre_totals['country'].isin(countries)) &
+                (genre_totals['month'] == month)
+            ]
+            if not subset.empty:
+                genre_iap = float(subset['genre_iap_usd'].sum())
+
+        # Store denominator: sum across constituent countries
+        store_iap = None
+        if countries:
+            sub_store = store_totals[
+                (store_totals['country'].isin(countries)) &
+                (store_totals['month'] == month)
+            ]
+            if not sub_store.empty:
+                store_iap = float(sub_store['store_iap_usd'].sum())
+
+        rows_out.append({
+            'product_code':     row['product_code'],
+            'product_name':     row['product_name'],
+            'genre':            row['genre'],
+            'market':           market,
+            'month':            month,
+            'company_gross_usd': float(row['gross_usd']),
+            'company_iap_usd':  float(row['company_iap_usd']),
+            'iap_pct':          float(row['iap_pct']),
+            'genre_iap_usd':    genre_iap,
+            'market_share_pct': (float(row['company_iap_usd']) / genre_iap * 100)
+                                 if genre_iap and genre_iap > 0 else None,
+            'store_iap_usd':    store_iap,
+            'store_share_pct':  (float(row['company_iap_usd']) / store_iap * 100)
+                                 if store_iap and store_iap > 0 else None,
+        })
+
+    if not rows_out:
+        print("  ○ compute_market_share: no rows produced")
+        con.close()
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows_out)
+
+    # ── Step 7: Portfolio rank within genre × market × month ─────────────────
+    df['portfolio_rank'] = (
+        df.groupby(['genre', 'market', 'month'])['company_iap_usd']
+          .rank(method='dense', ascending=False)
+          .astype(int)
+    )
+
+    # ── Step 8: 3-month trend (pp change in market_share_pct) ─────────────────
+    df = df.sort_values(['product_code', 'market', 'month']).reset_index(drop=True)
+    df['_grp'] = df['product_code'] + '|' + df['market']
+    df['trend_3m_pp'] = (
+        df.groupby('_grp', sort=False)['market_share_pct']
+          .transform(lambda s: s - s.shift(3))
+    )
+    df = df.drop(columns=['_grp'])
+
+    # ── Step 9: Upsert into analytics.market_share ───────────────────────────
+    out_cols = [
+        'product_code', 'product_name', 'genre', 'market', 'month',
+        'company_gross_usd', 'company_iap_usd', 'iap_pct',
+        'genre_iap_usd', 'market_share_pct',
+        'store_iap_usd', 'store_share_pct',
+        'portfolio_rank', 'trend_3m_pp',
+    ]
+    df_out = df[out_cols].copy()
+    con.register('_ms_in', df_out)
+    con.execute("DELETE FROM analytics.market_share")
+    con.execute("""
+        INSERT INTO analytics.market_share
+            (product_code, product_name, genre, market, month,
+             company_gross_usd, company_iap_usd, iap_pct,
+             genre_iap_usd, market_share_pct,
+             store_iap_usd, store_share_pct,
+             portfolio_rank, trend_3m_pp)
+        SELECT product_code, product_name, genre, market, month,
+               company_gross_usd, company_iap_usd, iap_pct,
+               genre_iap_usd, market_share_pct,
+               store_iap_usd, store_share_pct,
+               portfolio_rank, trend_3m_pp
+        FROM _ms_in
+    """)
+    con.unregister('_ms_in')
+
+    # Null out implausible shares (>100%) — genre denominator too small for reliable estimate
+    con.execute("""
+        UPDATE analytics.market_share
+        SET market_share_pct = NULL
+        WHERE market_share_pct > 100
+    """)
+
+    n = con.execute("SELECT COUNT(*) FROM analytics.market_share").fetchone()[0]
+    games_with_share = con.execute(
+        "SELECT COUNT(*) FROM analytics.market_share WHERE market_share_pct IS NOT NULL"
+    ).fetchone()[0]
+    print(f"  ✓ market_share: {n:,} rows ({games_with_share:,} with genre denominator)")
+    con.close()
+    return df_out
+
+
+def compute_portfolio_summary(db_path: str | None = None) -> pd.DataFrame:
+    """
+    Aggregate company portfolio by genre × market × month.
+
+    Summarises total company IAP, portfolio market share, game count,
+    and the top-revenue game per cell. Reads from analytics.market_share.
+
+    Writes to analytics.portfolio_summary.
+    """
+    con = _con(db_path)
+
+    check = con.execute("SELECT COUNT(*) FROM analytics.market_share").fetchone()[0]
+    if check == 0:
+        print("  ○ portfolio_summary: market_share table empty — run compute_market_share() first")
+        con.close()
+        return pd.DataFrame()
+
+    df = con.execute("""
+        WITH ranked AS (
+            SELECT *,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY genre, market, month
+                       ORDER BY company_iap_usd DESC
+                   ) AS rn
+            FROM analytics.market_share
+        ),
+        top_game AS (
+            SELECT genre, market, month,
+                   product_code AS top_game_code,
+                   product_name AS top_game_name,
+                   market_share_pct AS top_game_share_pct
+            FROM ranked WHERE rn = 1
+        ),
+        agg AS (
+            SELECT
+                genre,
+                market,
+                month,
+                SUM(company_gross_usd)       AS total_company_gross_usd,
+                SUM(company_iap_usd)         AS total_company_iap_usd,
+                MAX(genre_iap_usd)           AS genre_iap_usd,
+                CASE WHEN MAX(genre_iap_usd) > 0
+                     THEN SUM(company_iap_usd) / MAX(genre_iap_usd) * 100
+                     ELSE NULL END            AS portfolio_share_pct,
+                COUNT(*)                     AS game_count
+            FROM analytics.market_share
+            GROUP BY 1, 2, 3
+        )
+        SELECT a.*, t.top_game_code, t.top_game_name, t.top_game_share_pct
+        FROM agg a
+        LEFT JOIN top_game t USING (genre, market, month)
+        ORDER BY a.genre, a.market, a.month
+    """).df()
+
+    if df.empty:
+        con.close()
+        return df
+
+    # 3-month trend on portfolio_share_pct
+    df = df.sort_values(['genre', 'market', 'month'])
+    df['trend_3m_pp'] = (
+        df.groupby(['genre', 'market'])['portfolio_share_pct']
+          .transform(lambda s: s - s.shift(3))
+    )
+
+    con.register('_ps_in', df)
+    con.execute("DELETE FROM analytics.portfolio_summary")
+    con.execute("""
+        INSERT INTO analytics.portfolio_summary
+            (genre, market, month,
+             total_company_gross_usd, total_company_iap_usd,
+             genre_iap_usd, portfolio_share_pct, game_count,
+             top_game_code, top_game_name, top_game_share_pct,
+             trend_3m_pp)
+        SELECT genre, market, month,
+               total_company_gross_usd, total_company_iap_usd,
+               genre_iap_usd, portfolio_share_pct, game_count,
+               top_game_code, top_game_name, top_game_share_pct,
+               trend_3m_pp
+        FROM _ps_in
+    """)
+    con.unregister('_ps_in')
+
+    n = con.execute("SELECT COUNT(*) FROM analytics.portfolio_summary").fetchone()[0]
+    print(f"  ✓ portfolio_summary: {n:,} rows")
+    con.close()
+    return df
+
+
+# ────────────────────────────────────────────────────────
 # ORCHESTRATOR
 # ────────────────────────────────────────────────────────
 
