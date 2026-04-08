@@ -190,6 +190,8 @@ _FALSE_POSITIVE_MAPPINGS = [
     "Võ Lâm Truyền Kỳ 1 Mobile",  # 3 months, 3 Unreliable, −100% (ST ≈ $0) — app delisted / wrong mapping
     "Hello Cafe",                  # 4 months, 4 Unreliable, 0 Accurate, 88.7% median |var| — wrong mapping
     "Metal Slug",                  # 2 months, 2 Unreliable, 0 Accurate, 70.9% median |var| — wrong mapping
+    "KON",                         # Mapped to Mobile Legends: Bang Bang (unified=57955d280211a6718a000002)
+                                   # Confirmed by Apple chart validator — KON is a different company game
     # NOTE: "YS" Sing-Malay is a PARTIAL false-positive (valid 2022-07–2023-03, then product
     # discontinued). Uses benchmark_valid_to date-cutoff — do NOT NULL the whole mapping.
 ]
@@ -1878,6 +1880,207 @@ def investigate_ys_singmalay(db_path: str | None = None) -> None:
         set_benchmark_cutoff("YS", "Sing-Malay", str(cutoff_date), db_path)
     elif not pd.isna(current_cutoff):
         print(f"  ✓ benchmark_valid_to already set to {current_cutoff}")
+
+
+# ────────────────────────────────────────────────────────
+# T15: APPLE RSS MAPPING VALIDATOR
+# ────────────────────────────────────────────────────────
+
+def validate_mappings_via_apple_charts(db_path: str | None = None) -> pd.DataFrame:
+    """
+    Cross-reference company game mappings against Apple's top-grossing chart.
+
+    For each company game mapped to an ST unified_app_id:
+      - Look up the iOS app_id in fact_apple_public_charts
+      - If found, compare the Apple chart app name to what we expect
+      - Flag as MISMATCH if the Apple name differs significantly from the company game name
+
+    Catches cases like KON → "Mobile Legends: Bang Bang" where the ST mapping
+    is pointing to the wrong (popular) app.
+
+    Returns DataFrame of flagged mismatches.
+    """
+    con = _con(db_path)
+
+    df: pd.DataFrame = con.execute("""
+        SELECT DISTINCT
+            cg.product_name,
+            cg.market,
+            cg.unified_app_id,
+            da.app_id,
+            da.name                AS st_app_name,
+            ac.name                AS apple_chart_name,
+            ac.rank                AS apple_rank,
+            ac.country             AS apple_country
+        FROM dim.dim_company_games cg
+        JOIN dim.dim_apps da
+          ON da.unified_app_id = cg.unified_app_id AND da.os = 'ios'
+        JOIN fact.fact_apple_public_charts ac
+          ON ac.app_id = da.app_id
+        WHERE cg.unified_app_id IS NOT NULL
+        ORDER BY cg.product_name, ac.country
+    """).df()
+    con.close()
+
+    if df.empty:
+        print("  ○ validate_mappings: no company games found in Apple charts "
+              "(most SEA MMORPGs route through web payments — expected)")
+        return df
+
+    # Flag potential mismatches: Apple chart name doesn't share any token with product name
+    def _is_mismatch(row) -> bool:
+        product_tokens = set(row['product_name'].lower().split())
+        apple_tokens = set(row['apple_chart_name'].lower().split())
+        # Remove common noise words
+        noise = {'mobile', 'game', 'vng', 'sea', 'mini', 'm', 'the', 'of', 'a'}
+        product_tokens -= noise
+        apple_tokens -= noise
+        return len(product_tokens & apple_tokens) == 0
+
+    df['mismatch_flag'] = df.apply(_is_mismatch, axis=1)
+    mismatches = df[df['mismatch_flag']].copy()
+
+    print(f"\n  Apple chart mapping validation:")
+    print(f"  {len(df['unified_app_id'].unique())} company games appear in Apple top-100")
+    if mismatches.empty:
+        print("  ✓ No obvious name mismatches detected")
+    else:
+        print(f"  ⚠ {len(mismatches['product_name'].unique())} potential false positives (name mismatch):")
+        for _, r in mismatches.drop_duplicates('product_name').iterrows():
+            print(f"    • {r['product_name']} ({r['market']}) → "
+                  f"Apple: '{r['apple_chart_name']}' [rank {r['apple_rank']} in {r['apple_country']}]")
+            print(f"      unified_app_id: {r['unified_app_id']}")
+    return mismatches
+
+
+# ────────────────────────────────────────────────────────
+# T16: GENRE AUTO-ASSIGNMENT
+# ────────────────────────────────────────────────────────
+
+# Curated name → genre lookup for known games in the company portfolio.
+# Priority: non-MMORPG genres first (those have distinct IAP% configs).
+# Names are matched case-insensitively as substrings against product_name.
+_GENRE_NAME_LOOKUP: list[tuple[str, str]] = [
+    # Turn-based RPG — App Store IAP-dominant, <10% variance when correctly mapped
+    ("Lethe Record",         "Turn-based RPG"),
+    ("Azure Fantasy",        "Turn-based RPG"),
+    ("Crown of Heroes",      "Turn-based RPG"),
+    ("The Play of Genesis",  "Turn-based RPG"),
+    ("Samurai Spirit",       "Turn-based RPG"),  # SNK fighter — closer to Turn-based RPG than Shoot
+    ("SNK All Star",         "Turn-based RPG"),  # SNK collection RPG
+    ("Dynasty Warrior",      "Turn-based RPG"),  # action but monetises like Turn-based RPG
+    # Shoot 'em Up — has VN-specific config (0.07%)
+    ("Call of Duty",         "Shoot 'em Up"),
+    ("Metal Slug",           "Shoot 'em Up"),
+    # Idle RPG — distinct IAP% in config
+    ("OMG3",                 "Idle RPG"),        # Onmyoji — gacha/idle collect RPG
+    ("Lucky Fishing",        "Idle RPG"),        # idle fishing genre
+    # Tycoon / Crafting
+    ("Hello Cafe",           "Tycoon / Crafting"),
+    ("Plant War",            "Tycoon / Crafting"),
+    # MOBA
+    ("KON",                  "MOBA"),
+    ("AutoChess",            "MOBA"),            # closest genre in config to strategy
+    # MMORPG — Vietnamese MMORPGs (catch-all for remaining)
+    ("Cloud Song",           "MMORPG"),
+    ("Ghost Story",          "MMORPG"),
+    ("Perfect World",        "MMORPG"),
+    ("Ngọa Long",            "MMORPG"),
+    ("Tan Thien Long",       "MMORPG"),
+    ("Tay Du",               "MMORPG"),
+    ("Kiem Vu",              "MMORPG"),
+    ("JX1M",                 "MMORPG"),
+    ("MU Angel",             "MMORPG"),
+    ("Pure 3Q",              "MMORPG"),
+    ("3Q Phản Kích",         "MMORPG"),
+    ("Thiếu Niên",           "MMORPG"),
+    ("Tuyết Ưng",            "MMORPG"),
+    ("Nhất Mộng",            "MMORPG"),
+    ("Thần Điêu",            "MMORPG"),
+    ("DauLa",                "MMORPG"),
+    ("Ngoalong",             "MMORPG"),
+    ("Đại Chiến",            "MMORPG"),
+    ("Đại Đạo",              "MMORPG"),
+    ("TuTienLenLuon",        "MMORPG"),
+    ("Dũng Giả",             "MMORPG"),
+    ("360mobi",              "MMORPG"),
+    ("JX1",                  "MMORPG"),
+    # Remaining 13 unmatched — added after first auto-assign run
+    ("YS",                   "Platformer / Runner"),  # same game as YS Sing-Malay
+    ("CheonSangBi",          "MMORPG"),               # Korean MMORPG (천상비)
+    ("Justice",              "MMORPG"),               # Justice Mobile — CN MMORPG
+    ("Phong Than",           "MMORPG"),               # Vietnamese MMORPG
+    ("Thiên Khởi",           "MMORPG"),               # Vietnamese MMORPG
+    ("Tân Tiếu Ngạo",        "MMORPG"),               # Vietnamese MMORPG (Laughing Proud Wanderer)
+    ("KTO",                  "MMORPG"),               # abbreviated Vietnamese MMORPG
+    ("City Sun",             "Tycoon / Crafting"),    # city building / simulation
+]
+
+
+def auto_assign_genres(dry_run: bool = False, db_path: str | None = None) -> pd.DataFrame:
+    """
+    Assign genres to company games with NULL genre using _GENRE_NAME_LOOKUP.
+    Matches product_name case-insensitively as a substring.
+
+    dry_run=True: prints assignments without writing to DB.
+    Returns DataFrame of games that would be updated.
+    """
+    con = _con(db_path)
+    null_genre: pd.DataFrame = con.execute("""
+        SELECT id, product_name, market, unified_app_id, genre
+        FROM dim.dim_company_games
+        WHERE genre IS NULL
+        ORDER BY product_name, market
+    """).df()
+    con.close()
+
+    if null_genre.empty:
+        print("  ✓ auto_assign_genres: all games already have genres")
+        return null_genre
+
+    assignments = []
+    for _, row in null_genre.iterrows():
+        name_lower = str(row['product_name']).lower()
+        assigned = None
+        for pattern, genre in _GENRE_NAME_LOOKUP:
+            if pattern.lower() in name_lower:
+                assigned = genre
+                break
+        if assigned:
+            assignments.append({
+                'id': row['id'], 'product_name': row['product_name'],
+                'market': row['market'], 'new_genre': assigned,
+            })
+
+    result_df = pd.DataFrame(assignments) if assignments else pd.DataFrame(
+        columns=['id', 'product_name', 'market', 'new_genre'])
+
+    unmatched = null_genre[~null_genre['id'].isin(result_df['id'] if not result_df.empty else [])].copy()
+
+    print(f"\n  Genre auto-assignment: {len(null_genre)} NULL-genre games")
+    print(f"  Matched: {len(result_df)} | Unmatched: {len(unmatched)}")
+
+    if not result_df.empty:
+        print("\n  Assignments:")
+        for _, r in result_df.iterrows():
+            print(f"    {r['product_name']} / {r['market']} → {r['new_genre']}")
+
+    if not unmatched.empty:
+        print("\n  Unmatched (will keep NULL genre):")
+        for _, r in unmatched.iterrows():
+            print(f"    {r['product_name']} / {r['market']}")
+
+    if not dry_run and not result_df.empty:
+        con = _con(db_path)
+        for _, r in result_df.iterrows():
+            con.execute(
+                "UPDATE dim.dim_company_games SET genre = ? WHERE id = ?",
+                [r['new_genre'], int(r['id'])]
+            )
+        con.close()
+        print(f"\n  ✓ auto_assign_genres: {len(result_df)} genres written to DB")
+
+    return result_df
 
 
 # ────────────────────────────────────────────────────────

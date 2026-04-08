@@ -216,11 +216,21 @@ def cmd_extract_apple():
     load_apple_charts()
 
 
+# ── Genre Auto-Assignment ────────────────────────────────────────────────────
+
+def cmd_genre_assign():
+    print("\n=== Genre Auto-Assignment ===")
+    from analytics import auto_assign_genres
+    auto_assign_genres()
+
+
 # ── Analytics v2 (benchmark accuracy improvement) ────────────────────────────
 
 def cmd_analytics_v2():
     print("\n=== Analytics v2: Benchmark Accuracy Improvement ===")
     from analytics import (
+        validate_mappings_via_apple_charts,
+        auto_assign_genres,
         investigate_ys_singmalay,
         investigate_high_variance_genres,
         compute_iap_sensitivity,
@@ -230,6 +240,12 @@ def cmd_analytics_v2():
         get_calibration_factors_v2,
         compute_composite_benchmark,
     )
+    print("── T16: Genre Auto-Assignment ──")
+    auto_assign_genres()
+
+    print("── T15: Apple Chart Mapping Validator ──")
+    validate_mappings_via_apple_charts()
+
     print("── Task 1: IAP% Sensitivity ──")
     compute_iap_sensitivity()
 
@@ -312,7 +328,7 @@ def main():
     parser.add_argument('command', choices=[
                             'init', 'import', 'st-files', 'extract',
                             'extract-charts', 'extract-apple',
-                            'analytics', 'analytics-v2',
+                            'analytics', 'analytics-v2', 'genre-assign',
                             'status', 'all',
                         ],
                         help="Command to run")
@@ -327,6 +343,7 @@ def main():
         'extract-apple': cmd_extract_apple,
         'analytics': cmd_analytics,
         'analytics-v2': cmd_analytics_v2,
+        'genre-assign': cmd_genre_assign,
         'status': cmd_status,
         'all': cmd_all,
     }
